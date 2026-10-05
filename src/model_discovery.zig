@@ -1318,8 +1318,14 @@ pub fn templateSupportsThinking(tmpl: []const u8) bool {
     return std.mem.indexOf(u8, tmpl, "enable_thinking") != null or
         std.mem.indexOf(u8, tmpl, "<think>") != null or
         std.mem.indexOf(u8, tmpl, "<ifm|think") != null or
+        std.mem.indexOf(u8, tmpl, "<|START_THINKING|>") != null or
         std.mem.indexOf(u8, tmpl, "thought") != null or
         std.mem.indexOf(u8, tmpl, "<|channel>") != null;
+}
+
+test "templateSupportsThinking: Cohere's special-token think block counts" {
+    try std.testing.expect(templateSupportsThinking("<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>{% if reasoning %}<|START_THINKING|>{% endif %}"));
+    try std.testing.expect(!templateSupportsThinking("<|START_OF_TURN_TOKEN|><|USER_TOKEN|>{{ msg }}"));
 }
 
 const TemplateSniff = struct { present: bool = false, thinking: bool = false };
