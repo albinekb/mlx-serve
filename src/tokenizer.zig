@@ -86,6 +86,10 @@ pub const Tokenizer = struct {
     /// (?i) contractions, {1,3} digit groups, `/` in the punct tail).
     /// Parsed from the tokenizer.json Split regex.
     pretok_style: PretokStyle = .gpt2,
+    /// The tokenizer.json runs a `Split` of `\d{1,3}(?=(?:\d{3})*\b)` BEFORE its main regex (Cohere): a
+    /// number that ends at a word boundary is cut into groups of up to 3 digits counted from the RIGHT
+    /// (`0021` -> `0`,`021`), and the main regex then runs on each remaining piece on its own.
+    digit_split_right: bool = false,
     /// HF `Metaspace` pre-tokenizer (mmBERT / Gemma-2 class tokenizer.json):
     /// a leading ▁ is prepended when the text does not already start with
     /// one (`prepend_scheme`; `first` = only text at offset 0, never after a
@@ -549,7 +553,10 @@ pub const Tokenizer = struct {
         }
         switch (self.pretok_style) {
             .gpt2 => try gpt2PreTokenize(allocator, text, self.digit_group, &words),
-            .llama3 => try llama3PreTokenize(allocator, text, &words),
+            .llama3 => if (self.digit_split_right)
+                try llama3PreTokenizeRightDigits(allocator, text, &words)
+            else
+                try llama3PreTokenize(allocator, text, &words),
         }
 
         // For each word: map bytes to unicode chars, then BPE merge, then look up vocab
@@ -1003,6 +1010,48 @@ fn gpt2PreTokenize(allocator: std.mem.Allocator, text: []const u8, digit_group: 
 /// are treated caseless, so a mid-word case transition there doesn't split —
 /// same text, off-reference boundary; revisit with real Lu/Ll tables if a
 /// checkpoint's traffic warrants it.
+/// Whether the character at `i` is a regex `\w` (letter, digit, underscore). `\b` between a digit and
+/// this character is NOT a word boundary.
+fn isWordCharAt(text: []const u8, i: usize) bool {
+    if (i >= text.len) return false;
+    const c = text[i];
+    if (c < 0x80) return std.ascii.isAlphanumeric(c) or c == '_';
+    const cp_info = decodeCodepoint(text, i) orelse return false;
+    return isLetterOrMark(cp_info.cp) or isDigit(cp_info.cp);
+}
+
+/// `Split(\d{1,3}(?=(?:\d{3})*\b), Isolated)` followed by the Llama-3-style regex applied to every
+/// remaining piece separately (HF `Sequence`). A run of digits that ends at a word boundary is cut
+/// into groups from the right, the first group taking the remainder (`0021` -> `0`,`021`; `12345` ->
+/// `12`,`345`); a run glued to a following letter or underscore is not isolated and falls through to
+/// the main regex's own `\p{N}{1,3}`. Because each piece is tokenized alone, a run of spaces next to
+/// a number stays one token (`"  1"` -> `"  "`,`"1"`), which a single combined pass cannot do.
+fn llama3PreTokenizeRightDigits(allocator: std.mem.Allocator, text: []const u8, words: *std.ArrayList([]const u8)) !void {
+    var seg_start: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (!std.ascii.isDigit(text[i])) {
+            i += 1;
+            continue;
+        }
+        var j = i;
+        while (j < text.len and std.ascii.isDigit(text[j])) j += 1;
+        if (!isWordCharAt(text, j)) {
+            if (seg_start < i) try llama3PreTokenize(allocator, text[seg_start..i], words);
+            const n = j - i;
+            var take: usize = if (n % 3 == 0) 3 else n % 3;
+            var p = i;
+            while (p < j) : (take = 3) {
+                try words.append(allocator, try allocator.dupe(u8, text[p .. p + take]));
+                p += take;
+            }
+            seg_start = j;
+        }
+        i = j;
+    }
+    if (seg_start < text.len) try llama3PreTokenize(allocator, text[seg_start..], words);
+}
+
 fn llama3PreTokenize(allocator: std.mem.Allocator, text: []const u8, words: *std.ArrayList([]const u8)) !void {
     var i: usize = 0;
     while (i < text.len) {
@@ -1270,7 +1319,8 @@ fn isLetter(cp: u21) bool {
     if (cp >= 'A' and cp <= 'Z') return true;
     if (cp >= 'a' and cp <= 'z') return true;
     // Common Unicode letter ranges
-    if (cp >= 0xC0 and cp <= 0x024F) return true; // Latin Extended
+    // Latin Extended. U+00D7 (×) and U+00F7 (÷) sit inside the block but are math symbols (Sm).
+    if (cp >= 0xC0 and cp <= 0x024F) return cp != 0xD7 and cp != 0xF7;
     if (cp >= 0x0400 and cp <= 0x04FF) return true; // Cyrillic
     if (cp >= 0x4E00 and cp <= 0x9FFF) return true; // CJK
     if (cp >= 0x3040 and cp <= 0x30FF) return true; // Hiragana/Katakana
@@ -1577,6 +1627,7 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         .tok_type = tok_type,
         .digit_group = if (root.get("pre_tokenizer")) |pt| digitGroupFromPreTokenizer(pt) else 1,
         .pretok_style = if (root.get("pre_tokenizer")) |pt| pretokStyleFromPreTokenizer(pt) else .gpt2,
+        .digit_split_right = if (root.get("pre_tokenizer")) |pt| digitSplitRightFromPreTokenizer(pt) else false,
         .metaspace_prepend = if (root.get("pre_tokenizer")) |pt| metaspaceFromPreTokenizer(pt).prepend else .never,
         .metaspace_split = if (root.get("pre_tokenizer")) |pt| metaspaceFromPreTokenizer(pt).split else false,
         .byte_fallback = if (model_obj.get("byte_fallback")) |v| v == .bool and v.bool else false,
@@ -1641,6 +1692,23 @@ fn pretokStyleFromPreTokenizer(pt: std.json.Value) PretokStyle {
         }
     }
     return .gpt2;
+}
+
+/// A `Split` whose regex is exactly Cohere's right-aligned digit isolation, inside a `Sequence` (or alone).
+fn digitSplitRightFromPreTokenizer(pt: std.json.Value) bool {
+    if (pt != .object) return false;
+    const want = "\\d{1,3}(?=(?:\\d{3})*\\b)";
+    if (splitRegexOf(pt)) |rx| return std.mem.eql(u8, rx, want);
+    if (pt.object.get("pretokenizers")) |list| {
+        if (list == .array) {
+            for (list.array.items) |sub| {
+                if (sub == .object) {
+                    if (splitRegexOf(sub)) |rx| if (std.mem.eql(u8, rx, want)) return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 fn splitRegexIsLlama3(node: std.json.Value) bool {
@@ -2369,6 +2437,58 @@ test "tokenizer.json digit-group parse: a trailing Digits(individual) rule overr
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(u8, 1), digitGroupFromPreTokenizer(parsed.value));
+}
+
+fn expectRightDigitWords(input: []const u8, expected: []const []const u8) !void {
+    const allocator = testing.allocator;
+    var words = std.ArrayList([]const u8).empty;
+    defer {
+        for (words.items) |w| allocator.free(w);
+        words.deinit(allocator);
+    }
+    try llama3PreTokenizeRightDigits(allocator, input, &words);
+    try testing.expectEqual(expected.len, words.items.len);
+    for (expected, words.items) |e, g| try testing.expectEqualStrings(e, g);
+}
+
+test "isLetter: the Latin-1 multiplication and division signs are not letters" {
+    try testing.expect(!isLetter(0xD7)); // ×
+    try testing.expect(!isLetter(0xF7)); // ÷
+    try testing.expect(isLetter(0xC9)); // É
+    try testing.expect(isLetter(0xE9)); // é
+}
+
+test "cohere pre-tokenizer: numbers are cut into groups of 3 from the RIGHT" {
+    try expectRightDigitWords("0021", &.{ "0", "021" });
+    try expectRightDigitWords("12345", &.{ "12", "345" });
+    try expectRightDigitWords("123", &.{"123"});
+    try expectRightDigitWords("1234567", &.{ "1", "234", "567" });
+    try expectRightDigitWords("42", &.{"42"});
+}
+
+test "cohere pre-tokenizer: the main regex runs on each piece alone, so spaces beside a number stay together" {
+    try expectRightDigitWords("x = 12345", &.{ "x", " =", " ", "12", "345" });
+    try expectRightDigitWords("a  1", &.{ "a", "  ", "1" });
+    try expectRightDigitWords("v 4723 b", &.{ "v", " ", "4", "723", " b" });
+}
+
+test "cohere pre-tokenizer: a number glued to a letter or underscore is not isolated" {
+    // `\b` fails between the digit and the letter, so the isolation Split does not match and the
+    // main regex's own left-aligned `\p{N}{1,3}` applies, exactly as in the reference.
+    try expectRightDigitWords("1234abc", &.{ "123", "4", "abc" });
+    try expectRightDigitWords("0021_x", &.{ "002", "1", "_x" }); // `_` prefixes the word, as in the main regex
+}
+
+test "tokenizer.json: Cohere's right-aligned digit Split is detected, an ordinary {1,3} one is not" {
+    const allocator = testing.allocator;
+    const cohere = "{\"type\":\"Sequence\",\"pretokenizers\":[{\"type\":\"Split\",\"pattern\":{\"Regex\":\"\\\\d{1,3}(?=(?:\\\\d{3})*\\\\b)\"},\"behavior\":\"Isolated\"}]}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, cohere, .{});
+    defer parsed.deinit();
+    try testing.expect(digitSplitRightFromPreTokenizer(parsed.value));
+    const plain = "{\"type\":\"Split\",\"pattern\":{\"Regex\":\"\\\\p{N}{1,3}\"},\"behavior\":\"Isolated\"}";
+    var p2 = try std.json.parseFromSlice(std.json.Value, allocator, plain, .{});
+    defer p2.deinit();
+    try testing.expect(!digitSplitRightFromPreTokenizer(p2.value));
 }
 
 test "tokenizer.json digit-group parse: {1,3} Split rule sets digit_group 3" {
