@@ -36635,13 +36635,7 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
             \\threadgroup float gp[TG / 32];
         else
             "",
-        if (logit_sel)
-            \\  float l = float(logits[rbase + e]);
-            \\  float sy = 1.0f / (1.0f + metal::precise::exp(metal::abs(l)));
-            \\  float sg = (l < 0.0f) ? sy : (1.0f - sy);
-            \\  rk[e] = l + float(bias[e]);
-            \\  rw[e] = sg;
-        else if (sigmoid)
+        if (sigmoid)
             // MLX's `Sigmoid` unary op, verbatim (unary_ops.h): the two-sided
             // form, not 1/(1+exp(-x)) — they differ in the last ulp. `exp` is
             // spelled PRECISE because copying upstream's TEXT is not copying
@@ -36657,8 +36651,7 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
             \\  float l = float(logits[rbase + e]);
             \\  float sy = 1.0f / (1.0f + metal::precise::exp(metal::abs(l)));
             \\  float sg = (l < 0.0f) ? sy : (1.0f - sy);
-            \\  rk[e] = sg + float(bias[e]);
-            \\  rw[e] = sg;
+            ++ "\n  // kolibri1 selects on the raw logit + bias; the others on sigmoid + bias.\n  rk[e] = " ++ (if (logit_sel) "l" else "sg") ++ " + float(bias[e]);\n  rw[e] = sg;"
         else
             \\  rk[e] = float(logits[rbase + e]);
         ,

@@ -1282,7 +1282,12 @@ pub fn fillOptionalToolDefKeys(allocator: std.mem.Allocator, tools_json: []const
 /// absent effort to low on this family.
 pub fn isQwen38EffortTemplate(tpl: []const u8) bool {
     // Kolibri's effort list also spells 'xhigh' but has its own vocabulary.
-    return std.mem.indexOf(u8, tpl, "'xhigh'") != null and std.mem.indexOf(u8, tpl, "_sv_reasoning_effort") == null;
+    return std.mem.indexOf(u8, tpl, "'xhigh'") != null and !isKolibriEffortTemplate(tpl);
+}
+
+/// Kolibri-1's template: the one place that names its private effort variable.
+pub fn isKolibriEffortTemplate(tpl: []const u8) bool {
+    return std.mem.indexOf(u8, tpl, "_sv_reasoning_effort") != null;
 }
 
 pub fn templateConsumesEffort(tpl: []const u8) bool {
@@ -1463,7 +1468,7 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try buf.appendSlice(allocator, glm5EffortFor(effort));
         try buf.append(allocator, '"');
-    } else if (std.mem.indexOf(u8, chat_config.chat_template, "_sv_reasoning_effort") != null) {
+    } else if (isKolibriEffortTemplate(chat_config.chat_template)) {
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try buf.appendSlice(allocator, kolibriEffortFor(effort, enable_thinking));
         try buf.append(allocator, '"');
