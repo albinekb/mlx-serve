@@ -34443,7 +34443,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
             else
                 try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.scales", config.quant_bits);
             const k_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight");
-            const k_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.k_proj.biases", &config);
+            const k_b = try getAttnBias(weights, name_buf, prefix, li, "self_attn.k_proj.biases", &config, probe_attn_scales);
             // Gemma 4 MoE: global layers use K=V (no separate v_proj)
             const v_w = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.weight") orelse k_w;
             const v_s = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.scales") orelse k_s;
@@ -34456,7 +34456,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                         (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_proj.scales") orelse mlx.mlx_array_new())
                     else
                         try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits),
-                    .q_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.q_proj.biases", &config),
+                    .q_b = try getAttnBias(weights, name_buf, prefix, li, "self_attn.q_proj.biases", &config, probe_attn_scales),
                     .k_w = k_w,
                     .k_s = k_s,
                     .k_b = k_b,
@@ -34468,7 +34468,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                         (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.o_proj.scales") orelse mlx.mlx_array_new())
                     else
                         try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits),
-                    .o_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.o_proj.biases", &config),
+                    .o_b = try getAttnBias(weights, name_buf, prefix, li, "self_attn.o_proj.biases", &config, probe_attn_scales),
                     // An arch that DECLARES QK norm must ship it (a missing weight
                     // there is a broken checkpoint, not a variant). One that
                     // declares it off — gpt_oss — has no q_norm/k_norm tensors at
@@ -45354,6 +45354,14 @@ fn getLayerBias(weights: *const Weights, buf: *[256]u8, prefix: []const u8, laye
     if (config.quant_bits == 0) return mlx.mlx_array_new();
     if (config.quant_mode.hasBiases()) return try getLayerWeight(weights, buf, prefix, layer, suffix);
     return getLayerWeightOpt(weights, buf, prefix, layer, suffix) orelse mlx.mlx_array_new();
+}
+
+/// An attention projection's affine `biases`. A pack that keeps attention dense bf16 beside affine
+/// experts (mlx-community's North 6-bit) has no scales and no biases for it; `probe` is the arch's
+/// "attention may ship dense" flag, and a missing tensor then means dense, not a broken pack.
+fn getAttnBias(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8, config: *const ModelConfig, probe: bool) error{MissingWeight}!mlx.mlx_array {
+    if (probe) return getLayerWeightOpt(weights, buf, prefix, layer, suffix) orelse mlx.mlx_array_new();
+    return getLayerBias(weights, buf, prefix, layer, suffix, config);
 }
 
 /// Optional-typed variant for fields stored as `?mlx_array` (e.g. PLE projections).
