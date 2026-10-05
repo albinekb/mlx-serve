@@ -26220,15 +26220,16 @@ pub const Transformer = struct {
                 const next_norm = if (layer_idx + 1 == n_layers) self.final_norm else ml[layer_idx + 1].input_norm;
                 h = try self.gemma4MoeLayerTail(h, attn_out, lw, ctx.use_encoder_scalars, next_norm, &carried_normed, !is_prefill);
             } else if (is_kolibri) {
-                // Sandwich norms; the tensor-to-field mapping is at the binding.
-                const attn_n = try self.rmsNorm(attn_out, lw.pre_ff_norm.?);
+                // Sandwich norms: post_attn on the attention output, pre_ff on
+                // the residual before the MoE, post_ff on the MoE output.
+                const attn_n = try self.rmsNorm(attn_out, lw.post_attn_norm);
                 defer _ = mlx.mlx_array_free(attn_n);
                 var h_mid = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_add(&h_mid, h, attn_n, self.s));
                 _ = mlx.mlx_array_free(h);
                 h = h_mid;
 
-                const ff_normed = try self.rmsNorm(h, lw.post_attn_norm);
+                const ff_normed = try self.rmsNorm(h, lw.pre_ff_norm.?);
                 defer _ = mlx.mlx_array_free(ff_normed);
                 const mlp_out = try self.moeMLP(ff_normed, &lw.mlp.moe);
                 defer _ = mlx.mlx_array_free(mlp_out);
@@ -33821,10 +33822,15 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
             lw.encoder_layer_scalar = weights.get(enc_name);
         }
 
-        // kolibri1 sandwich norms: pre_ff_norm carries `post_attn_norm` (applied
-        // to the attention output), post_ff_norm `post_ffn_norm` (to the MoE out).
+        // kolibri1 sandwich norms, named by what they do (the Gemma convention):
+        // post_attn_norm is applied to the attention output, pre_ff_norm to the
+        // residual before the MoE, post_ff_norm to the MoE output. The checkpoint
+        // spells them differently: its `post_attention_layernorm` is the pre-FFN
+        // norm (already loaded above as post_attn_norm) and its `post_attn_norm`
+        // is the attention-output norm.
         if (is_kolibri) {
-            lw.pre_ff_norm = try getLayerWeight(weights, name_buf, prefix, li, "post_attn_norm.weight");
+            lw.pre_ff_norm = lw.post_attn_norm;
+            lw.post_attn_norm = try getLayerWeight(weights, name_buf, prefix, li, "post_attn_norm.weight");
             lw.post_ff_norm = try getLayerWeight(weights, name_buf, prefix, li, "post_ffn_norm.weight");
         }
 
