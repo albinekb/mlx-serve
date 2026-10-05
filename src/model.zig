@@ -1384,6 +1384,10 @@ pub const ModelConfig = struct {
         } else if (is_gemma) {
             if (self.gen_top_k == null) self.gen_top_k = 64;
             if (self.gen_top_p == null) self.gen_top_p = 0.95;
+        } else if (std.mem.eql(u8, t, "cohere2_moe")) {
+            // Cohere's card: "temperature=1.0, top_p=0.95" (no top_k), and its benchmarks ran at
+            // those values; the pack's generation_config.json carries no sampling fields.
+            if (self.gen_top_p == null) self.gen_top_p = 0.95;
         } else if (std.mem.eql(u8, t, "inkling_mm_model")) {
             // Thinking Machines publishes NO recommendation (no
             // generation_config.json in any Inkling repo; their bundled
@@ -5236,6 +5240,16 @@ test "applyFamilySamplingDefaults never overrides explicit generation_config val
     partial.applyFamilySamplingDefaults();
     try testing.expectEqual(@as(?u32, 20), partial.gen_top_k);
     try testing.expectEqual(@as(?f32, 0.8), partial.gen_top_p);
+
+    // cohere2_moe: top_p 0.95 from the vendor card, no top_k, and an explicit value still wins.
+    var cohere = ModelConfig{ .model_type = "cohere2_moe" };
+    cohere.applyFamilySamplingDefaults();
+    try testing.expectEqual(@as(?f32, 0.95), cohere.gen_top_p);
+    try testing.expectEqual(@as(?u32, null), cohere.gen_top_k);
+    var tuned = ModelConfig{ .model_type = "cohere2_moe" };
+    tuned.gen_top_p = 0.7;
+    tuned.applyFamilySamplingDefaults();
+    try testing.expectEqual(@as(?f32, 0.7), tuned.gen_top_p);
 }
 
 test "defaultEnableThinking: opt-in per arch, and every existing arch stays off" {
