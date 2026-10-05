@@ -212,6 +212,12 @@ pub const ModelConfig = struct {
     // kolibri1: top-k SELECTED on logits + expert_bias (no sigmoid before the
     // bias), WEIGHTED by sigmoid(logits) of the picks; requires moe_sigmoid_router.
     moe_logit_select: bool = false,
+    // kolibri1 routes on fp32 logits (its reference does); cohere2_moe on the model dtype, as
+    // its reference does — a more precise router would diverge from both.
+    moe_router_f32: bool = false,
+    // cohere2_moe: attention and the MLP/MoE both read the ONE input norm and
+    // their outputs add to the residual together: h = x + attn(n) + mlp(n).
+    parallel_block: bool = false,
     moe_route_norm: bool = true,
     router_scaling_factor: f32 = 1.0,
     // Layers [0, first_k_dense_replace) use a dense MLP instead of MoE
@@ -1324,6 +1330,9 @@ pub const ModelConfig = struct {
         // Thinking-off here would have to be enforced in the PROMPT, and
         // harmony offers no way to do it.
         if (std.mem.eql(u8, self.model_type, "gpt_oss")) return true;
+        // cohere2_moe: the template's own default is `reasoning` ON (only an explicit false or
+        // reasoning_effort "none" turns it off), so a silent request thinks, as the author intends.
+        if (std.mem.eql(u8, self.model_type, "cohere2_moe")) return true;
         if (has_tools and std.mem.eql(u8, self.model_type, "muse_glimmer")) return true;
         // bailing_hybrid (Ling 3.0): thinking-on with or without tools. The
         // checkpoint's own template normalizes an undefined `enable_thinking`
@@ -3410,6 +3419,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.hidden_act = .silu;
         config.moe_sigmoid_router = true;
         config.moe_logit_select = true;
+        config.moe_router_f32 = true;
         config.moe_route_norm = false;
         config.router_scaling_factor = 1.0;
         config.rope_scaling_factor = 1.0;
@@ -3425,6 +3435,78 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // Full-attention layers carry no positional encoding.
         if (config.has_explicit_layer_types) {
             for (0..@min(config.num_hidden_layers, 128)) |i| config.layer_no_rope[i] = config.layer_is_global[i];
+        }
+    } else if (std.mem.eql(u8, model_type, "cohere2_moe")) {
+        // Cohere North-Mini-Code-1.0 (49 layers, 128 experts top-8, hidden 2048). A PARALLEL block
+        // (one input_layernorm feeds attention and the MLP; h = x + attn + mlp), no QK norm, no
+        // sandwich norms, no shared experts. Sliding(4096) layers rotate (INTERLEAVED pairs);
+        // full-attention layers carry no position, except layer 0 — the dense prefix layer, which
+        // the reference force-ropes (prefix_dense_sliding_window_pattern == 1). Routing is
+        // sigmoid(logits), top-k picked on the raw logits (sigmoid is monotonic), no renorm, no
+        // bias. Layer 0 is a dense MLP at prefix_dense_intermediate_size; the config's
+        // `intermediate_size` is the EXPERT width. Tied embeddings.
+        // Reference: mlx-lm cohere2_moe.py (Terrencezzj/mlx-lm f43507c).
+        config.model_type = "cohere2_moe";
+        config.weight_prefix = "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = false;
+        config.hidden_act = .silu;
+        config.parallel_block = true;
+        config.moe_sigmoid_router = true;
+        config.moe_logit_select = true;
+        config.moe_route_norm = false;
+        config.router_scaling_factor = 1.0;
+        config.rope_scaling_factor = 1.0;
+        config.rope_interleaved_pairs = true;
+        config.tie_word_embeddings = true;
+        config.query_pre_attn_scalar = config.head_dim;
+        config.rope_local_base_freq = config.rope_theta;
+        // Only what the shipped checkpoint sets is supported; anything else is a different model
+        // (mlx-lm's default for an absent logit_scale is 0.0625, so absence is refused too).
+        const logit_scale = if (jsonField(cfg_obj, "logit_scale")) |v| try jsonFloat(v) else 0.0625;
+        if (logit_scale != 1.0) {
+            log.err("cohere2_moe: only logit_scale 1.0 is supported (got {d})\n", .{logit_scale});
+            return error.UnsupportedCohereConfig;
+        }
+        if (jsonField(cfg_obj, "norm_topk_prob")) |v| {
+            if (v == .bool and v.bool) {
+                log.err("cohere2_moe: norm_topk_prob=true not supported\n", .{});
+                return error.UnsupportedCohereConfig;
+            }
+        }
+        if (jsonField(cfg_obj, "num_shared_experts")) |v| {
+            if (v == .integer and v.integer > 0) {
+                log.err("cohere2_moe: shared experts not supported\n", .{});
+                return error.UnsupportedCohereConfig;
+            }
+        }
+        if (jsonField(cfg_obj, "expert_selection_fn")) |v| {
+            if (v == .string and !std.mem.eql(u8, v.string, "sigmoid")) {
+                log.err("cohere2_moe: only sigmoid expert selection supported (got '{s}')\n", .{v.string});
+                return error.UnsupportedCohereConfig;
+            }
+        }
+        if (jsonField(cfg_obj, "prefix_dense_sliding_window_pattern")) |v| {
+            if (v == .integer and v.integer != 1) {
+                log.err("cohere2_moe: prefix_dense_sliding_window_pattern != 1 not supported\n", .{});
+                return error.UnsupportedCohereConfig;
+            }
+        }
+        // Expert width is `intermediate_size`; the dense prefix layers use their own width.
+        config.moe_intermediate_size = config.intermediate_size;
+        if (jsonField(cfg_obj, "prefix_dense_intermediate_size")) |v| {
+            if (v == .integer) config.intermediate_size = try jsonU32(v);
+        }
+        if (jsonField(cfg_obj, "first_k_dense_replace")) |v| {
+            if (v == .integer) config.first_k_dense_replace = try jsonU32(v);
+        }
+        // Full-attention layers carry no positional encoding, except the dense prefix.
+        if (config.has_explicit_layer_types) {
+            for (0..@min(config.num_hidden_layers, 128)) |i| {
+                config.layer_no_rope[i] = config.layer_is_global[i] and i >= config.first_k_dense_replace;
+            }
         }
     } else if (std.mem.eql(u8, model_type, "inkling_mm_model")) {
         // Thinking Machines Inkling Small (276B-A12B MoE, natively multimodal;
@@ -5168,6 +5250,10 @@ test "defaultEnableThinking: opt-in per arch, and every existing arch stays off"
     // reasoning earns its keep. A plain chat request defaults to the
     // prompt-committed to=user channel (chat.noThinkTailSuffix) — a real
     // skip, so there is nothing to deliver or drop.
+    // cohere2_moe opts in: its template's own default is reasoning ON.
+    const cohere = ModelConfig{ .model_type = "cohere2_moe" };
+    try testing.expect(cohere.defaultEnableThinking(false));
+    try testing.expect(cohere.defaultEnableThinking(true));
     const muse = ModelConfig{ .model_type = "muse_glimmer" };
     try testing.expect(!muse.defaultEnableThinking(false));
     try testing.expect(muse.defaultEnableThinking(true));
@@ -5634,6 +5720,77 @@ test "ModelConfig parses kolibri1: logit-bias routing, NoPE on full layers, sand
     try testing.expect(config.isGlobalLayer(3) and !config.isGlobalLayer(0));
     try testing.expectApproxEqAbs(@as(f32, 10000.0), config.rope_local_base_freq, 1e-3);
     try testing.expectEqual(@as(u32, 128), config.query_pre_attn_scalar);
+}
+
+test "ModelConfig parses cohere2_moe: parallel block, dense prefix, NoPE on full layers but layer 0" {
+    // Trimmed copy of North-Mini-Code-1.0's config.json: layer 0 is the dense prefix (full attention,
+    // forced RoPE), then sliding x3 + full. `intermediate_size` is the EXPERT width.
+    const json =
+        \\{
+        \\  "model_type": "cohere2_moe",
+        \\  "hidden_size": 2048,
+        \\  "num_hidden_layers": 5,
+        \\  "num_attention_heads": 32,
+        \\  "num_key_value_heads": 4,
+        \\  "head_dim": 128,
+        \\  "intermediate_size": 768,
+        \\  "prefix_dense_intermediate_size": 3072,
+        \\  "prefix_dense_sliding_window_pattern": 1,
+        \\  "first_k_dense_replace": 1,
+        \\  "rms_norm_eps": 1e-06,
+        \\  "logit_scale": 1.0,
+        \\  "vocab_size": 262144,
+        \\  "max_position_embeddings": 500000,
+        \\  "rope_theta": 50000,
+        \\  "sliding_window": 4096,
+        \\  "num_experts": 128,
+        \\  "num_experts_per_tok": 8,
+        \\  "num_shared_experts": 0,
+        \\  "norm_topk_prob": false,
+        \\  "expert_selection_fn": "sigmoid",
+        \\  "use_parallel_block": true,
+        \\  "layer_types": ["full_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"],
+        \\  "quantization": {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("cohere2_moe", config.model_type);
+    try testing.expect(config.parallel_block and !config.has_qk_norm and config.tie_word_embeddings);
+    try testing.expect(config.moe_sigmoid_router and config.moe_logit_select and !config.moe_route_norm);
+    try testing.expectEqual(@as(u32, 128), config.num_experts);
+    try testing.expectEqual(@as(u32, 8), config.num_experts_per_tok);
+    // The expert width and the dense-prefix width are not the config's own naming.
+    try testing.expectEqual(@as(u32, 768), config.moe_intermediate_size);
+    try testing.expectEqual(@as(u32, 3072), config.intermediate_size);
+    try testing.expectEqual(@as(u32, 1), config.first_k_dense_replace);
+    try testing.expectEqual(@as(u32, 4096), config.sliding_window);
+    // Layer 0 is full attention WITH rope (dense prefix); the later full layer is NoPE.
+    try testing.expect(config.isGlobalLayer(0) and config.isGlobalLayer(4));
+    try testing.expect(!config.layerSkipsRope(0) and config.layerSkipsRope(4));
+    try testing.expect(!config.layerSkipsRope(1));
+    try testing.expect(config.rope_interleaved_pairs);
+    try testing.expectEqual(@as(u32, 128), config.query_pre_attn_scalar);
+}
+
+test "ModelConfig refuses cohere2_moe variants it cannot run" {
+    const base =
+        \\{"model_type":"cohere2_moe","hidden_size":2048,"num_hidden_layers":2,"num_attention_heads":32,"num_key_value_heads":4,
+        \\ "head_dim":128,"intermediate_size":768,"vocab_size":1000,"num_experts":8,"num_experts_per_tok":2,"sliding_window":64,
+        \\ "layer_types":["full_attention","sliding_attention"],"quantization":{"group_size":32,"bits":4,"mode":"mxfp4"},
+    ;
+    const ok = base ++ \\"logit_scale":1.0}
+    ;
+    _ = try parseConfigFromJson(testing.allocator, ok);
+    // An absent logit_scale means mlx-lm's 0.0625, which this port does not apply.
+    const no_scale = base ++ \\"x":0}
+    ;
+    try testing.expectError(error.UnsupportedCohereConfig, parseConfigFromJson(testing.allocator, no_scale));
+    const shared = base ++ \\"logit_scale":1.0,"num_shared_experts":2}
+    ;
+    try testing.expectError(error.UnsupportedCohereConfig, parseConfigFromJson(testing.allocator, shared));
+    const renorm = base ++ \\"logit_scale":1.0,"norm_topk_prob":true}
+    ;
+    try testing.expectError(error.UnsupportedCohereConfig, parseConfigFromJson(testing.allocator, renorm));
 }
 
 test "ModelConfig parses laguna (poolside Laguna-S-2.1): per-layer heads, softplus gate, YaRN, sigmoid MoE" {

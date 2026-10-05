@@ -26256,8 +26256,9 @@ pub const Transformer = struct {
         const cfg = &self.config;
         const is_gemma4 = cfg.isGemma4Layers();
         const is_kolibri = std.mem.eql(u8, cfg.model_type, "kolibri1");
-        // kolibri1 runs laguna's attention arm (no gate, NoPE on full layers).
-        const is_laguna = is_kolibri or std.mem.eql(u8, cfg.model_type, "laguna");
+        const is_cohere = cfg.parallel_block;
+        // kolibri1 and cohere2_moe run laguna's attention arm (no gate; NoPE on full layers).
+        const is_laguna = is_kolibri or is_cohere or std.mem.eql(u8, cfg.model_type, "laguna");
         const is_inkling = cfg.isInkling();
         const is_mla = cfg.isMla();
         // gpt_oss and MiMo share the sink attention arm (per-layer geometry).
@@ -26432,6 +26433,21 @@ pub const Transformer = struct {
 
                 var h_next = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_add(&h_next, h, mlp_n, self.s));
+                _ = mlx.mlx_array_free(h);
+                h = h_next;
+            } else if (is_cohere) {
+                // Parallel block: attention and the MLP/MoE both read the one input norm
+                // (`normed`); h = h + attn_out + mlp_out. Layer 0 is a dense MLP.
+                const mlp_out = switch (lw.mlp) {
+                    .moe => |*mw| try self.moeMLP(normed, mw),
+                    .dense => |*dw| try self.denseMLP(normed, dw),
+                };
+                defer _ = mlx.mlx_array_free(mlp_out);
+                var branches = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(branches);
+                try mlx.check(mlx.mlx_add(&branches, attn_out, mlp_out, self.s));
+                var h_next = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_add(&h_next, h, branches, self.s));
                 _ = mlx.mlx_array_free(h);
                 h = h_next;
             } else if (is_inkling) {
@@ -29477,7 +29493,12 @@ pub const Transformer = struct {
             var q_r = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(q_r);
             try mlx.check(mlx.mlx_reshape(&q_r, q_proj, &q_shape, 4, self.s));
-            const q_normed = try self.rmsNorm(q_r, fa.q_norm);
+            // cohere2_moe has no QK norm (an empty handle); the others always do.
+            const q_normed = if (fa.q_norm.ctx != null) try self.rmsNorm(q_r, fa.q_norm) else blk: {
+                var alias = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_array_set(&alias, q_r));
+                break :blk alias;
+            };
             defer _ = mlx.mlx_array_free(q_normed);
             var q_t = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(q_t);
@@ -29485,7 +29506,7 @@ pub const Transformer = struct {
             if (no_rope) {
                 try mlx.check(mlx.mlx_array_set(&q_rope, q_t));
             } else {
-                try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, 1.0, offset, rope_freqs, self.s));
+                try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, cfg.rope_interleaved_pairs, rope_base, 1.0, offset, rope_freqs, self.s));
             }
 
             // K: proj → reshape → k_norm → transpose → rope
@@ -29496,7 +29517,11 @@ pub const Transformer = struct {
             var k_r = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(k_r);
             try mlx.check(mlx.mlx_reshape(&k_r, k_proj, &kv_shape, 4, self.s));
-            const k_normed = try self.rmsNorm(k_r, fa.k_norm);
+            const k_normed = if (fa.k_norm.ctx != null) try self.rmsNorm(k_r, fa.k_norm) else blk: {
+                var alias = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_array_set(&alias, k_r));
+                break :blk alias;
+            };
             defer _ = mlx.mlx_array_free(k_normed);
             var k_t = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(k_t);
@@ -29504,7 +29529,7 @@ pub const Transformer = struct {
             if (no_rope) {
                 try mlx.check(mlx.mlx_array_set(&k_rope, k_t));
             } else {
-                try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, 1.0, offset, rope_freqs, self.s));
+                try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, cfg.rope_interleaved_pairs, rope_base, 1.0, offset, rope_freqs, self.s));
             }
 
             // YaRN mscale: scale the rotated slice of q/k by attention_factor. This
@@ -32206,7 +32231,7 @@ pub const Transformer = struct {
 
     fn moeRouterLogits(self: *Transformer, router_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
         const cfg = &self.config;
-        if (cfg.moe_logit_select) {
+        if (cfg.moe_logit_select and cfg.moe_router_f32) {
             // kolibri1 routes on fp32 logits (router_w is bound as f32, [in, out]).
             var x32 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(x32);
@@ -33937,6 +33962,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const is_hy3 = std.mem.eql(u8, config.model_type, "hy_v3");
     const is_laguna = std.mem.eql(u8, config.model_type, "laguna");
     const is_kolibri = std.mem.eql(u8, config.model_type, "kolibri1");
+    const is_cohere = config.parallel_block;
     const is_inkling = std.mem.eql(u8, config.model_type, "inkling_mm_model");
     const is_bailing = std.mem.eql(u8, config.model_type, "bailing_hybrid");
     const is_qwen4 = config.isQwen4();
@@ -33944,7 +33970,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const is_mimo = config.isMimo();
     const is_glm = config.isGlm5();
     // Attention projections that may ship dense bf16 beside quantized experts.
-    const probe_attn_scales = is_laguna or is_mimo or is_kolibri;
+    const probe_attn_scales = is_laguna or is_mimo or is_kolibri or is_cohere;
 
     for (0..config.num_hidden_layers) |i| {
         const li: u32 = @intCast(i);
@@ -33959,7 +33985,8 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
             try getLayerWeight(weights, name_buf, prefix, li, "attn_norm.weight")
         else
             try getLayerWeight(weights, name_buf, prefix, li, "input_layernorm.weight");
-        lw.post_attn_norm = if (is_qwen4)
+        // qwen4_exp and the parallel-block cohere2_moe carry no post-attention norm.
+        lw.post_attn_norm = if (is_qwen4 or is_cohere)
             mlx.mlx_array_new()
         else if (is_inkling)
             try getLayerWeight(weights, name_buf, prefix, li, "mlp_norm.weight")
@@ -34776,6 +34803,54 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                 try mlx.check(mlx.mlx_array_eval(f));
                 try owned_bf16.append(allocator, f);
                 lw.mlp.moe.router_w = f;
+            }
+        } else if (layer_is_moe and is_cohere) {
+            // cohere2_moe: stacked experts under `mlp.switch_mlp.*` (mlx-lm layout), a bf16 router
+            // `mlp.gate.weight` with no bias, no shared experts. Selection runs on the raw logits,
+            // so the bias is zeros (the kolibri1 `logit_bias` router mode needs one).
+            const ex = hy3ExpertContainer(weights, name_buf, prefix, li);
+            var exbuf: [64]u8 = undefined;
+            var zero_bias = mlx.mlx_array_new();
+            const bias_dims = [_]c_int{@intCast(config.num_experts)};
+            try mlx.check(mlx.mlx_zeros(&zero_bias, &bias_dims, 1, .float32, s));
+            try owned_bf16.append(allocator, zero_bias);
+            lw.mlp = .{
+                .moe = .{
+                    .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
+                    .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.scales") orelse mlx.mlx_array_new(),
+                    .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.biases") orelse mlx.mlx_array_new(),
+                    .switch_gate_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.weight")),
+                    .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.scales")) orelse mlx.mlx_array_new(),
+                    .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.biases")) orelse mlx.mlx_array_new(),
+                    .switch_up_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.weight")),
+                    .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.scales")) orelse mlx.mlx_array_new(),
+                    .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.biases")) orelse mlx.mlx_array_new(),
+                    .switch_down_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.weight")),
+                    .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.scales")) orelse mlx.mlx_array_new(),
+                    .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.biases")) orelse mlx.mlx_array_new(),
+                    .shared_gate_w = mlx.mlx_array_new(),
+                    .shared_gate_s = mlx.mlx_array_new(),
+                    .shared_gate_b = mlx.mlx_array_new(),
+                    .shared_up_w = mlx.mlx_array_new(),
+                    .shared_up_s = mlx.mlx_array_new(),
+                    .shared_up_b = mlx.mlx_array_new(),
+                    .shared_down_w = mlx.mlx_array_new(),
+                    .shared_down_s = mlx.mlx_array_new(),
+                    .shared_down_b = mlx.mlx_array_new(),
+                    .expert_bias = zero_bias,
+                    .route_norm = false,
+                    .route_scale = 1.0,
+                    .shared_ungated = true,
+                },
+            };
+            {
+                const mw = &lw.mlp.moe;
+                // The router stays in the model dtype ([in, out]); its reference rounds the logits there.
+                try maybeTransposeForBf16(&mw.router_w, mw.router_s, &owned_bf16, allocator, s);
+                if (mw.router_s.ctx != null) return error.UnsupportedCohereConfig; // router ships bf16
+                try maybeTransposeForBf16(&mw.switch_gate_w, mw.switch_gate_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.switch_up_w, mw.switch_up_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.switch_down_w, mw.switch_down_s, &owned_bf16, allocator, s);
             }
         } else if (layer_is_moe and is_kolibri) {
             // kolibri1: stacked experts under `mlp.experts.*` (mlx-lm layout),
