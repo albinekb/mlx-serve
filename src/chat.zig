@@ -1472,6 +1472,10 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try buf.appendSlice(allocator, kolibriEffortFor(effort, enable_thinking));
         try buf.append(allocator, '"');
+    } else if (isCohereTemplate(chat_config.chat_template)) {
+        // The template reads its own `reasoning` flag (default on) and treats only the word "none"
+        // as thinking-off, so the generic "no_think" below would leave thinking ON.
+        try buf.appendSlice(allocator, if (enable_thinking) ",\"reasoning\":true" else ",\"reasoning\":false,\"reasoning_effort\":\"none\"");
     } else try buf.appendSlice(allocator, if (enable_thinking)
         ",\"reasoning_effort\":\"high\""
     else if (inkling_style)
@@ -1917,6 +1921,7 @@ const tool_markup_openers = [_][]const u8{
     "<tool_calls:", // Hy3 suffixed wrapper
     "<atem:", // Muse-Glimmer ATEM (covers function_calls/invoke/parameter)
     INKLING_INVOKE_TAG,
+    COHERE_ACTION_OPEN, // Cohere North-Mini-Code action block
 };
 
 /// Earliest index of MiniCPM5 attribute-form tool markup, or null.
@@ -3056,6 +3061,9 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
     // DeepSeek-V4 DSML: everything from `<｜DSML｜` on is a tool-call block.
     if (std.mem.indexOf(u8, buf, "<｜DSML｜") != null) return true;
 
+    // Cohere: the action opener is one special token; everything from it on is call payload.
+    if (std.mem.indexOf(u8, buf, COHERE_ACTION_OPEN) != null) return true;
+
     // Muse-Glimmer ATEM: everything from the wrapper on is call payload.
     if (std.mem.indexOf(u8, buf, "<atem:") != null) return true;
     // Muse segment-header hold: between <|start|> and <|message|> only the
@@ -3507,6 +3515,9 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // whose distinctive marker no other family emits; the generic `<tool`
     // scans never see the shape and other families never carry the marker.
     try parseInklingToolCalls(allocator, text, &calls);
+    // Cohere `<|START_ACTION|>[…]<|END_ACTION|>` — distinctive single-token markers; runs on the
+    // think-stripped text so a call written inside the thought is never executed.
+    try parseCohereToolCalls(allocator, effective_text, &calls);
     // Muse-Glimmer ATEM (`<atem:invoke name="X">`): distinctive namespace
     // prefix no other family emits; the generic `<tool` scan never sees it
     // (the bytes after `<` are `atem`, not `tool`). Runs on the FULL text —
@@ -5306,6 +5317,44 @@ const ATEM_INVOKE_CLOSE = "</atem:invoke>";
 /// other family emits. A body that is not a COMPLETE balanced JSON object is
 /// a truncated call: ship the name with `{}` rather than a fragment, per the
 /// same rule the ATEM and DSML parsers follow.
+/// Cohere (North-Mini-Code): a call turn is `<|START_ACTION|>[{"tool_call_id": "0", "tool_name": "x",
+/// "parameters": {...}}, ...]<|END_ACTION|>` — one JSON ARRAY, any number of calls. Both markers are
+/// single special tokens that arrive whole.
+const COHERE_ACTION_OPEN = "<|START_ACTION|>";
+const COHERE_ACTION_CLOSE = "<|END_ACTION|>";
+
+/// Whether a chat template is Cohere's (turn tokens + a think block + an action block).
+pub fn isCohereTemplate(tpl: []const u8) bool {
+    return std.mem.indexOf(u8, tpl, "<|CHATBOT_TOKEN|>") != null and std.mem.indexOf(u8, tpl, "<|START_THINKING|>") != null;
+}
+
+fn parseCohereToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, text, pos, COHERE_ACTION_OPEN)) |open| {
+        const body_start = open + COHERE_ACTION_OPEN.len;
+        const close = std.mem.indexOfPos(u8, text, body_start, COHERE_ACTION_CLOSE);
+        pos = close orelse text.len;
+        const body = std.mem.trim(u8, text[body_start..pos], " \n\t\r");
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .array) continue;
+        for (parsed.value.array.items) |item| {
+            if (item != .object) continue;
+            const name_v = item.object.get("tool_name") orelse continue;
+            if (name_v != .string) continue;
+            // `parameters` may be absent for a no-argument call.
+            const args_json = if (item.object.get("parameters")) |pv|
+                try std.json.Stringify.valueAlloc(allocator, pv, .{})
+            else
+                try allocator.dupe(u8, "{}");
+            errdefer allocator.free(args_json);
+            const name = try allocator.dupe(u8, name_v.string);
+            errdefer allocator.free(name);
+            try calls.append(allocator, .{ .name = name, .arguments = args_json, .inferred = false });
+        }
+    }
+}
+
 fn parseHarmonyToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
     if (std.mem.indexOf(u8, text, HARMONY_CHANNEL_TAG) == null) return;
     var seg_start: usize = 0;
@@ -10411,6 +10460,65 @@ test "serializeExtraContext: glm5_next maps effort onto low|high|max" {
         var want: [64]u8 = undefined;
         try testing.expect(std.mem.indexOf(u8, r, try std.fmt.bufPrint(&want, "\"reasoning_effort\":\"{s}\"", .{c.out})) != null);
     }
+}
+
+const cohere_tpl_probe = "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>{% if reasoning %}<|START_THINKING|>{% else %}<|START_THINKING|><|END_THINKING|>{% endif %}";
+
+test "isCohereTemplate: turn tokens plus a think block, and nothing else" {
+    try testing.expect(isCohereTemplate(cohere_tpl_probe));
+    try testing.expect(!isCohereTemplate("{{ messages }}<think>"));
+    try testing.expect(!isCohereTemplate("{%- set _sv_reasoning_effort = reasoning_effort -%}['high', 'xhigh', 'max']"));
+}
+
+test "serializeExtraContext cohere: thinking-off sets the template's own reasoning flag, never no_think" {
+    const allocator = testing.allocator;
+    var config = ChatConfig{ .chat_template = cohere_tpl_probe, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
+    _ = &config;
+    const on = try serializeExtraContext(allocator, &config, true, null);
+    defer allocator.free(on);
+    try testing.expect(std.mem.indexOf(u8, on, "\"reasoning\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, on, "no_think") == null);
+    const off = try serializeExtraContext(allocator, &config, false, null);
+    defer allocator.free(off);
+    try testing.expect(std.mem.indexOf(u8, off, "\"reasoning\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, off, "\"reasoning_effort\":\"none\"") != null);
+    try testing.expect(std.mem.indexOf(u8, off, "no_think") == null);
+}
+
+test "parseToolCalls cohere: one action block carries any number of calls" {
+    const raw = "<think>I should look both up.</think><|START_ACTION|>[\n" ++
+        "    {\"tool_call_id\": \"0\", \"tool_name\": \"get_weather\", \"parameters\": {\"city\": \"Berlin\", \"days\": 3}},\n" ++
+        "    {\"tool_call_id\": \"1\", \"tool_name\": \"get_time\", \"parameters\": {}}\n" ++
+        "]<|END_ACTION|>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("get_weather", calls[0].name);
+    try testing.expectEqualStrings("{\"city\":\"Berlin\",\"days\":3}", calls[0].arguments);
+    try testing.expectEqualStrings("get_time", calls[1].name);
+    try testing.expectEqualStrings("{}", calls[1].arguments);
+    try testing.expect(!calls[0].inferred);
+}
+
+test "parseToolCalls cohere: a missing parameters key is an empty call, a call inside the thought is not run" {
+    const bare = "<think></think><|START_ACTION|>[{\"tool_call_id\": \"0\", \"tool_name\": \"ping\"}]<|END_ACTION|>";
+    const calls = (try parseToolCalls(testing.allocator, bare)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("{}", calls[0].arguments);
+
+    const in_thought = "<think>maybe <|START_ACTION|>[{\"tool_call_id\": \"0\", \"tool_name\": \"rm\", \"parameters\": {}}]<|END_ACTION|></think>All done.";
+    try testing.expect((try parseToolCalls(testing.allocator, in_thought)) == null);
+}
+
+test "parseToolCalls cohere: malformed or truncated action JSON yields no call" {
+    try testing.expect((try parseToolCalls(testing.allocator, "<think></think><|START_ACTION|>[{\"tool_call_id\": \"0\", \"tool_na")) == null);
+    try testing.expect((try parseToolCalls(testing.allocator, "<think></think><|START_ACTION|>not json<|END_ACTION|>")) == null);
+}
+
+test "streamShouldBufferForTools cohere: the whole action block is held from its opener on" {
+    try testing.expect(streamShouldBufferForTools("<|START_ACTION|>[{\"tool_call_id\""));
+    try testing.expect(!streamShouldBufferForTools("The weather in Berlin is rainy."));
 }
 
 test "kolibriEffortFor: thinking-off is the word 'none', never hy3's no_think" {

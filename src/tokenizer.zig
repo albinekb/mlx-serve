@@ -352,6 +352,7 @@ pub const Tokenizer = struct {
     /// all read as `<think>`. Installed when the vocabulary carries the family
     /// marker; false otherwise.
     pub fn installMarkerAliases(self: *Tokenizer) bool {
+        if (self.installCohereAliases()) return true;
         const family_marker = "<ifm|think>";
         if (self.special_tokens.get(family_marker) == null) return false;
         var map = std.AutoHashMap(u32, []const u8).init(self.allocator);
@@ -379,6 +380,30 @@ pub const Tokenizer = struct {
             const close = self.special_tokens.get(pair[1]) orelse continue;
             closers.put(open, close) catch return false;
         }
+        self.marker_aliases = map;
+        self.marker_closers = closers;
+        return true;
+    }
+
+    /// Cohere (North-Mini-Code) wraps the think block and the answer in single special tokens:
+    /// `<|START_THINKING|>…<|END_THINKING|>` then `<|START_TEXT|>answer<|END_TEXT|>` (or an
+    /// action block, which the tool parser reads as itself). Decode spells the think pair as the
+    /// bare `<think>`/`</think>` every think-splitter already understands and drops the TEXT
+    /// wrapper, so the answer arrives unwrapped. The opener pairs with its atomic closer.
+    fn installCohereAliases(self: *Tokenizer) bool {
+        const think_open = self.special_tokens.get("<|START_THINKING|>") orelse return false;
+        const think_close = self.special_tokens.get("<|END_THINKING|>") orelse return false;
+        if (self.special_tokens.get("<|START_ACTION|>") == null) return false;
+        var map = std.AutoHashMap(u32, []const u8).init(self.allocator);
+        errdefer map.deinit();
+        map.put(think_open, "<think>") catch return false;
+        map.put(think_close, "</think>") catch return false;
+        for ([_][]const u8{ "<|START_TEXT|>", "<|END_TEXT|>" }) |wrap| {
+            if (self.special_tokens.get(wrap)) |id| map.put(id, "") catch return false;
+        }
+        var closers = std.AutoHashMap(u32, u32).init(self.allocator);
+        errdefer closers.deinit();
+        closers.put(think_open, think_close) catch return false;
         self.marker_aliases = map;
         self.marker_closers = closers;
         return true;
@@ -1565,7 +1590,7 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         .eos_id = eos_id,
         .parsed_json = parsed,
     };
-    if (built.installMarkerAliases()) log.info("Tokenizer: K2-Horizon markers alias to <think> / GLM tool tags\n", .{});
+    if (built.installMarkerAliases()) log.info("Tokenizer: family markers alias to <think> (K2-Horizon / Cohere)\n", .{});
     return built;
 }
 
@@ -2884,6 +2909,38 @@ test "K2-Horizon markers decode to the canonical think / GLM tool-tag spellings"
     );
     // Encoding the marker text still lands on the special id: the alias is decode-only.
     try testing.expectEqual(@as(?u32, 0), tok.specialTokenId("<ifm|think>"));
+}
+
+test "installMarkerAliases: Cohere think pair reads as <think>, TEXT wrapper decodes to nothing, action stays raw" {
+    const allocator = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    defer tok.deinit();
+    const specials = [_][]const u8{
+        "<|START_THINKING|>", "<|END_THINKING|>", "<|START_TEXT|>", "<|END_TEXT|>", "<|START_ACTION|>", "<|END_ACTION|>",
+    };
+    for (specials, 0..) |t, i| {
+        try tok.id_to_token.put(@intCast(i), t);
+        try tok.special_tokens.put(try allocator.dupe(u8, t), @intCast(i));
+    }
+    try testing.expect(tok.installMarkerAliases());
+    const out = try tok.decode(allocator, &.{ 0, 1, 2, 3, 4, 5 }, false);
+    defer allocator.free(out);
+    // The action block is deliberately NOT aliased: the tool parser reads Cohere's own markers.
+    try testing.expectEqualStrings("<think></think><|START_ACTION|><|END_ACTION|>", out);
+    // The think opener pairs with its atomic closer (the in-stream reasoning bound commits it).
+    try testing.expectEqual(@as(?u32, 1), tok.markerCloserFor(0));
+    try testing.expectEqual(@as(?u32, null), tok.markerCloserFor(4));
+}
+
+test "installMarkerAliases: a vocabulary without Cohere's action token is left alone" {
+    const allocator = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    defer tok.deinit();
+    for ([_][]const u8{ "<|START_THINKING|>", "<|END_THINKING|>" }, 0..) |t, i| {
+        try tok.id_to_token.put(@intCast(i), t);
+        try tok.special_tokens.put(try allocator.dupe(u8, t), @intCast(i));
+    }
+    try testing.expect(!tok.installMarkerAliases());
 }
 
 test "markerCloserFor: K2 think openers pair with their own closer" {

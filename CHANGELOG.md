@@ -3,6 +3,7 @@
 ## v26.10.2 — Many-User Fix - UNRELEASED - DEV
 
 ### New
+- **North Mini Code.** Cohere's coding model (`cohere2_moe`, 128 experts) runs from the MLX packs already on Hugging Face (such as `bsisduck/North-Mini-Code-1.0-MLX-MXFP4`), with thinking returned as `reasoning_content` (on by default, off with `reasoning_effort: none`) and tool calls.
 - **Kolibri-1.** Aleph Alpha's 78B-A3.5B MoE runs from the MLX packs already on Hugging Face (such as `here-be-dragons-ai/Kolibri-1-MLX-3bit`), with text, tool calls and thinking set by `reasoning_effort`.
 - **ZCode.** `mlx-serve launch zcode` and the app's code launcher point Z.ai's ZCode agent (built from source) at the local server with every served chat model and its advertised context, keeping its data under `~/.mlx-serve/zcode` (#708). Thanks @beamivalice.
 - **oMLX's Qwen3.8 Flash Next packs load.** Packs that ship the n-gram table inside the model files (such as `Jundot/Qwen3.8-Flash-Next-oQ4e-mtp`) now run, MTP included, and `--ple-gpu` copies their table into one GPU buffer at load (#686). Thanks @otarkhan.
