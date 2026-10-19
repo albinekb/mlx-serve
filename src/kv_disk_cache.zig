@@ -762,12 +762,13 @@ pub const DiskTier = struct {
     }
 
     /// Sweep other models' fingerprints under the same base: strays always, LRU down to what
-    /// this root leaves of the budget. A model's root changes with its config, so an old root
-    /// is reclaimed only here.
+    /// this root leaves of the budget (no budget, no LRU). A model's root changes with its
+    /// config, so an old root is reclaimed only here.
     pub fn sweepSiblings(self: *DiskTier) void {
         const base = self.base_dir orelse return;
-        self.refreshDiskBudget();
-        sweepBase(self.allocator, self.io, base, self.root, self.max_bytes -| self.total_bytes);
+        if (self.ssd_first) self.refreshDiskBudget();
+        const left = if (self.max_bytes == 0) std.math.maxInt(u64) else self.max_bytes -| self.total_bytes;
+        sweepBase(self.allocator, self.io, base, self.root, left);
     }
 
     pub fn entryCount(self: *const DiskTier) usize {
@@ -6907,11 +6908,17 @@ test "DiskTier: every tier sweeps sibling roots down to what its own root leaves
         h.* = t.total_bytes;
     }
 
+    // No cap: no LRU across roots.
+    {
+        var uncapped = try DiskTier.init(testing.allocator, io, base, "fp-live", 0, 128);
+        defer uncapped.deinit();
+        uncapped.sweepSiblings();
+        try testing.expect(tmp.dir.statFile(io, "fp-stale/e1/meta.json", .{}) catch null != null);
+    }
     // Under the old rule the stale root (held[1]) fit one sibling budget; the cap is the
     // whole base, so it must go once the live root takes its share.
     var live = try DiskTier.init(testing.allocator, io, base, "fp-live", held[0] + held[1] / 2, 128);
     defer live.deinit();
-    live.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
     live.sweepSiblings();
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-stale/e1/meta.json", .{}));
     try testing.expect(tmp.dir.statFile(io, "fp-live/e1/meta.json", .{}) catch null != null);
