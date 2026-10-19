@@ -37030,6 +37030,16 @@ pub fn quantParamsFromGeometry(
     return .{ .bits = (w_cols * 32) / in_dim, .group_size = in_dim / s_cols, .mode = mode };
 }
 
+/// An fp weight's params from bits x group_size alone (256 / 128 / 64 name mxfp8 / mxfp4 / nvfp4).
+fn fpParamsFromGroup(w_cols: u32, s_cols: u32) ?QuantParams {
+    if (s_cols == 0 or (w_cols * 32) % s_cols != 0) return null;
+    const per_group = (w_cols * 32) / s_cols;
+    const bits: u32 = if (per_group == 256) 8 else 4;
+    const gs = per_group / bits;
+    const mode = fpQuantModeFor(bits, gs) orelse return null;
+    return .{ .bits = bits, .group_size = gs, .mode = mode };
+}
+
 pub fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: ?u32) QuantParams {
     const w_shape = mlx.getShape(w);
     const s_shape = mlx.getShape(sc);
@@ -37047,14 +37057,13 @@ pub fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.
             // it exactly; solve, exactly as the affine arm below does.
             if (in_dim) |in| {
                 if (fpParamsFromGeometry(config, w_cols, s_cols, in)) |qp| return qp;
-            } else if (s_cols > 0 and (w_cols * 32) % s_cols == 0) {
-                const per_group = (w_cols * 32) / s_cols;
-                const bits: u32 = if (per_group == 256) 8 else 4;
-                const gs = per_group / bits;
-                if (fpQuantModeFor(bits, gs)) |mode| return .{ .bits = bits, .group_size = gs, .mode = mode };
-            }
+            } else if (fpParamsFromGroup(w_cols, s_cols)) |qp| return qp;
             return .{ .bits = config.quant_bits, .group_size = config.quant_group_size, .mode = config.quant_mode };
         }
+        // An affine root can still hold fp weights (AutomatosX AXQ packs: mxfp4 per-weight overrides).
+        if (in_dim) |in| {
+            if (quantParamsFromGeometry(w, sc, false, in)) |qp| return qp;
+        } else if (fpParamsFromGroup(w_cols, s_cols)) |qp| return qp;
         const gs: u32 = if (w_cols > 0 and s_cols > 0) (w_cols * 32) / (s_cols * 8) else 32;
         return .{ .bits = 8, .group_size = gs, .mode = .mxfp8 };
     }
@@ -45379,8 +45388,17 @@ fn splitFusedQkvRows(arr: mlx.mlx_array, q_rows: u32, kv_rows: u32, transpose: b
 fn getLayerBias(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8, config: *const ModelConfig) error{MissingWeight}!mlx.mlx_array {
     // A pack with no `quantization` block (Sushi's) still stores affine trunk linears beside dense ones.
     if (config.quant_bits == 0) return getLayerWeightOpt(weights, buf, prefix, layer, suffix) orelse mlx.mlx_array_new();
-    if (config.quant_mode.hasBiases()) return try getLayerWeight(weights, buf, prefix, layer, suffix);
+    if (config.quant_mode.hasBiases() and !fpScaled(weights, prefix, layer, suffix)) return try getLayerWeight(weights, buf, prefix, layer, suffix);
     return getLayerWeightOpt(weights, buf, prefix, layer, suffix) orelse mlx.mlx_array_new();
+}
+
+/// A `<linear>.biases` whose sibling scales are uint8 belongs to an fp weight, which has none.
+fn fpScaled(weights: *const Weights, prefix: []const u8, layer: u32, bias_suffix: []const u8) bool {
+    if (!std.mem.endsWith(u8, bias_suffix, "biases")) return false;
+    var buf: [256]u8 = undefined;
+    const name = std.fmt.bufPrint(&buf, "{s}.layers.{d}.{s}scales", .{ prefix, layer, bias_suffix[0 .. bias_suffix.len - "biases".len] }) catch return false;
+    const sc = weights.get(name) orelse return false;
+    return mlx.mlx_array_dtype(sc) == .uint8;
 }
 
 /// Optional-typed variant for fields stored as `?mlx_array` (e.g. PLE projections).
@@ -49861,6 +49879,49 @@ test "computeQuantParams resolves mixed nvfp4 + affine-override weights" {
     try testing.expectEqual(QuantMode.affine, qp_plain.mode);
     try testing.expectEqual(@as(u32, 8), qp_plain.bits);
     try testing.expectEqual(@as(u32, 64), qp_plain.group_size);
+}
+
+test "computeQuantParams resolves mxfp4 weights under an affine root (AXQ mixed packs)" {
+    const s = mlx.gpuStream();
+    const H = 2048;
+    var cfg = ModelConfig{};
+    cfg.quant_bits = 4;
+    cfg.quant_group_size = 32;
+    cfg.quant_mode = .affine;
+
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_zeros(&w, &[_]c_int{ 512, H * 4 / 32 }, 2, .uint32, s));
+    try mlx.check(mlx.mlx_zeros(&sc, &[_]c_int{ 512, H / 32 }, 2, .uint8, s));
+    for ([_]?u32{ H, null }) |hint| {
+        const qp = computeQuantParams(&cfg, w, sc, hint);
+        try testing.expectEqual(QuantMode.mxfp4, qp.mode);
+        try testing.expectEqual(@as(u32, 4), qp.bits);
+        try testing.expectEqual(@as(u32, 32), qp.group_size);
+    }
+}
+
+test "getLayerBias: an fp-scaled linear under an affine root has no biases, an affine one still needs them" {
+    const s = mlx.gpuStream();
+    var cfg = ModelConfig{};
+    cfg.quant_bits = 4;
+    cfg.quant_group_size = 32;
+    cfg.quant_mode = .affine;
+    var w = Weights.init(std.testing.allocator);
+    defer w.deinit();
+    var fp_sc = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&fp_sc, &[_]c_int{ 4, 2 }, 2, .uint8, s));
+    try w.map.put(try std.testing.allocator.dupe(u8, "m.layers.3.self_attn.k_proj.scales"), fp_sc);
+    var af_sc = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&af_sc, &[_]c_int{ 4, 2 }, 2, .bfloat16, s));
+    try w.map.put(try std.testing.allocator.dupe(u8, "m.layers.3.self_attn.v_proj.scales"), af_sc);
+
+    var buf: [256]u8 = undefined;
+    const b = try getLayerBias(&w, &buf, "m", 3, "self_attn.k_proj.biases", &cfg);
+    try testing.expect(b.ctx == null);
+    try testing.expectError(error.MissingWeight, getLayerBias(&w, &buf, "m", 3, "self_attn.v_proj.biases", &cfg));
 }
 
 test "QuantParamsCache put/lookup round-trip" {
