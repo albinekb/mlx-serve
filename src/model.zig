@@ -6009,6 +6009,35 @@ test "loadWeights reads only the shards the index names (issue #274)" {
     try std.testing.expectEqual(@as(u32, 1), w.count());
 }
 
+test "loadWeights reads a vision.safetensors sidecar the index does not name (AXQ packs)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const shard = struct {
+        fn write(t: std.testing.TmpDir, name: []const u8, comptime key: []const u8) !void {
+            const hdr = "{\"" ++ key ++ "\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+            var st: [8 + hdr.len + 4]u8 = undefined;
+            std.mem.writeInt(u64, st[0..8], hdr.len, .little);
+            @memcpy(st[8 .. 8 + hdr.len], hdr);
+            @memset(st[8 + hdr.len ..], 0);
+            try t.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = &st });
+        }
+    }.write;
+    try shard(tmp, "model-00001.safetensors", "language_model.model.norm.weight");
+    try shard(tmp, "vision.safetensors", "vision_tower.patch_embed.proj.weight");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"language_model.model.norm.weight\":\"model-00001.safetensors\"}}" });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const dir = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
+    defer allocator.free(dir);
+    var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, .{ .vision = true });
+    defer w.deinit();
+    try std.testing.expect(w.get("vision_tower.patch_embed.proj.weight") != null);
+}
+
 test "loadWeights ignores an index that names no shard on disk (re-sharded upload, stale index)" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;

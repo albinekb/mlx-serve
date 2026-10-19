@@ -5121,14 +5121,17 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // MiMo's heads and GLM's layer are in-checkpoint blocks of their own shape, read from the trunk's weights.
     var mimo_head: ?*mimo_mtp.Head = null;
     var glm_head: ?*glm_mtp.Head = null;
+    var mtp_failed = false;
     if (mtp_enabled and params.config.isMimo()) {
         mimo_head = loadMimoHead(sch.allocator, params.config, weights_ptr, xfm_ptr) catch |err| blk: {
             log.warn("MiMo MTP heads failed to load ({s}) — MTP off.\n", .{@errorName(err)});
+            mtp_failed = true;
             break :blk null;
         };
     } else if (mtp_enabled and params.config.isGlm5()) {
         glm_head = loadGlmHead(sch.allocator, params.config, weights_ptr, xfm_ptr) catch |err| blk: {
             log.warn("GLM MTP head failed to load ({s}) — MTP off.\n", .{@errorName(err)});
+            mtp_failed = true;
             break :blk null;
         };
     } else if (mtp_enabled and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
@@ -5153,11 +5156,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                     });
                 } else |bind_err| {
                     log.warn("MTP sidecar incompatible with target ({s}) — disabled.\n", .{@errorName(bind_err)});
+                    mtp_failed = true;
                     h.deinit();
                     sch.allocator.destroy(h);
                 }
             } else |load_err| {
                 log.warn("Failed to load MTP sidecar: {s} — disabled.\n", .{@errorName(load_err)});
+                mtp_failed = true;
                 sch.allocator.destroy(h);
             }
         } else |_| {}
@@ -5285,6 +5290,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         generate_mod.MtpHeadRef{ .qwen4 = xfm_ptr }
     else
         null;
+    entry.mtp_failed = mtp_failed;
     // Resolve the auto (0) cap here so every downstream reader of
     // `lm.mtp_depth` (server log lines, slot params) sees the real value.
     const mtp_depth_cfg = params.config.mtpDepth(params.mtp_depth);

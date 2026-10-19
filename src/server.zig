@@ -666,6 +666,12 @@ pub fn defaultEnableMtp(mtp_loaded: bool, dsv4_stages: bool) bool {
     return mtp_loaded or dsv4_stages;
 }
 
+/// `/v1/models` `mtp_available`: the dir ships a head this server can load. A head the
+/// load tried and failed (a layout it cannot bind) is not available.
+pub fn mtpAvailable(mtp_loaded: bool, mtp_failed: bool, on_disk: bool) bool {
+    return mtp_loaded or (on_disk and !mtp_failed);
+}
+
 /// Where an MTP head drafts without `--mtp`. CUDA's multi-row matmuls make a verify round pay;
 /// Vulkan has none and decodes plain.
 pub fn mtpAllowedByDefault(mtp_forced: bool, metal: bool, cuda: bool) bool {
@@ -7303,7 +7309,7 @@ fn renderModelEntry(
             if (drafter_loaded) "true" else "false",
             drafter_path_json,
             if (mtp_loaded) "true" else "false",
-            if (mtp_loaded or model_discovery.readStubMeta(io, allocator, entry.path).has_mtp) "true" else "false",
+            if (mtpAvailable(mtp_loaded, entry.mtp_failed, model_discovery.readStubMeta(io, allocator, entry.path).has_mtp)) "true" else "false",
             if (config.rowExactDecode()) "true" else "false",
             configuredKvQuantFor(config).wireName(),
             gen_temp_str,
@@ -7447,7 +7453,7 @@ fn renderModelEntry(
             sm.max_position_embeddings,
             sm.max_position_embeddings,
             if (sm.is_moe) "true" else "false",
-            if (sm.has_mtp) "true" else "false",
+            if (mtpAvailable(false, entry.mtp_failed, sm.has_mtp)) "true" else "false",
         });
     } else &[_]u8{};
     defer if (dims_part.len > 0) allocator.free(dims_part);
@@ -25568,6 +25574,15 @@ test "defaultEnableMtp: a loaded head drafts by default, MoE or not" {
     try t.expect(defaultEnableMtp(true, false));
     // DSpark: dsv4's own stages, loaded without a qwen head.
     try t.expect(defaultEnableMtp(false, true));
+}
+
+test "mtpAvailable: a head the load tried and failed is not available" {
+    const t = std.testing;
+    try t.expect(mtpAvailable(true, false, true));
+    // --no-mtp: on disk, never tried, still available.
+    try t.expect(mtpAvailable(false, false, true));
+    try t.expect(!mtpAvailable(false, true, true));
+    try t.expect(!mtpAvailable(false, false, false));
 }
 
 test "native speculation: resolved opt-out gates capability and API defaults" {

@@ -451,6 +451,11 @@ pub fn indexShardSet(io: std.Io, dir: std.Io.Dir) ?std.StringHashMapUnmanaged(vo
         freeShardSet(&set);
         return null;
     }
+    // AXQ packs ship the vision tower as a sidecar their index does not name.
+    const vision_sidecar = "vision.safetensors";
+    if (!set.contains(vision_sidecar)) if (dir.statFile(io, vision_sidecar, .{})) |_| {
+        if (a.dupe(u8, vision_sidecar)) |key| set.put(a, key, {}) catch a.free(key) else |_| {}
+    } else |_| {};
     return set;
 }
 

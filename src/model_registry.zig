@@ -200,6 +200,8 @@ pub const LoadedModel = struct {
     /// head auto-loaded from the model dir, or an arch whose head is part of
     /// its own trunk. Null when neither is present.
     mtp: ?generate_mod.MtpHeadRef = null,
+    /// The load tried the dir's MTP head and it failed to load or bind.
+    mtp_failed: bool = false,
     /// Default draft depth for MTP rounds (CLI `--mtp-max-depth`).
     mtp_depth: u32 = mtp_mod.DEFAULT_DEPTH,
     /// Per-model hot prefix cache — plan 05 drops the module-global hot
