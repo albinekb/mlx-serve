@@ -5713,3 +5713,7 @@ Cause: the tuned sorted expert kernel (`gather_qmm_nax`, the oMLX port) took aff
 Fix: `Fp4Q` decodes e4m3 scales at group 16 (`QuantMode.isFp4` at the three call sites), the paired SwiGLU kernel declines when per-expert scales exist (it ignores them), and `prefillDqGemm` takes the mode and serves MXFP8. 4600 -> 5340 tok/s.
 Guards: `segmented NAX sorted gather matches stock bit for bit on FP4 banks` (Flash Next shapes), the paired row-map case at group 16, `qmatmulBits: prefill-width MXFP8 calls take the dequant+GEMM route`. The expert kernel is exact (323 of 323 scored rows bit-identical); the MXFP8 route reorders sums, so judge it by `MLX_SERVE_PREFILL_DQ_GEMM=0` A/Bs.
 
+
+## Old SSD-tier roots were never reclaimed: 56 GB under a 20 GB cap (2026-10-19)
+
+**Defect.** `~/.mlx-serve/kv-cache` held 56 GB with `--prefix-cache-disk 20GB`. **Cause.** The cap bounds one model's root (`<base>/<fingerprint>`), and a root is renamed whenever the model's config or overrides change; the sweep over the other roots ran in SSD-first mode only, and even there let them hold one more cap's worth. **Fix.** Every tier sweeps sibling roots at load, down to what its own root leaves of the cap (`sweepSiblings`). **Guard.** `DiskTier: every tier sweeps sibling roots down to what its own root leaves of the cap`.

@@ -761,13 +761,13 @@ pub const DiskTier = struct {
         }
     }
 
-    /// Sweep other models' fingerprints under the same base: strays always, LRU once they
-    /// collectively exceed one budget's worth. SSD-first only.
+    /// Sweep other models' fingerprints under the same base: strays always, LRU down to what
+    /// this root leaves of the budget. A model's root changes with its config, so an old root
+    /// is reclaimed only here.
     pub fn sweepSiblings(self: *DiskTier) void {
-        if (!self.ssd_first) return;
         const base = self.base_dir orelse return;
         self.refreshDiskBudget();
-        sweepBase(self.allocator, self.io, base, self.root, self.max_bytes);
+        sweepBase(self.allocator, self.io, base, self.root, self.max_bytes -| self.total_bytes);
     }
 
     pub fn entryCount(self: *const DiskTier) usize {
@@ -6884,6 +6884,37 @@ test "DiskTier: the root-wide sweep drops strays and never touches the live tier
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-sibling/e1/meta.json", .{}));
     try testing.expect(tmp.dir.statFile(io, "fp-live/e1/c000000.safetensors", .{}) catch null != null);
     try testing.expect(tmp.dir.statFile(io, "fp-inflight/e3/c000000.safetensors", .{}) catch null != null);
+}
+
+test "DiskTier: every tier sweeps sibling roots down to what its own root leaves of the cap" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try fillCache(&cache, s, 1, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var held: [2]u64 = undefined;
+    for ([_][]const u8{ "fp-live", "fp-stale" }, &held) |fp, *h| {
+        var t = try DiskTier.init(testing.allocator, io, base, fp, 0, 128);
+        defer t.deinit();
+        _ = try t.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+        h.* = t.total_bytes;
+    }
+
+    // Under the old rule the stale root (held[1]) fit one sibling budget; the cap is the
+    // whole base, so it must go once the live root takes its share.
+    var live = try DiskTier.init(testing.allocator, io, base, "fp-live", held[0] + held[1] / 2, 128);
+    defer live.deinit();
+    live.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    live.sweepSiblings();
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-stale/e1/meta.json", .{}));
+    try testing.expect(tmp.dir.statFile(io, "fp-live/e1/meta.json", .{}) catch null != null);
 }
 
 test "DiskTier: SSM retention spacing is priced against the tier, not just capped" {
