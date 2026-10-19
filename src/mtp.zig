@@ -2279,7 +2279,48 @@ pub fn loadMtp(
         return loadHy3Mtp(allocator, s, &weights, p);
     }
 
+    try stackExpertsIntoSwitchMlp(&weights, p, s);
     return loadQwenMtp(allocator, s, &weights, p);
+}
+
+/// mlx-lm's sanitize: a head shipped one tensor per expert (`mlp.experts.{i}.*`,
+/// OptiQ and AXQ sidecars) becomes the stacked `mlp.switch_mlp.*` banks the loader reads.
+fn stackExpertsIntoSwitchMlp(weights: *Weights, p: []const u8, s: mlx.mlx_stream) !void {
+    const pre = "layers.0.mlp.";
+    var kb: [256]u8 = undefined;
+    const first = std.fmt.bufPrint(&kb, "{s}mtp." ++ pre ++ "experts.0.gate_proj.weight", .{p}) catch return;
+    if (weights.get(first) == null) return;
+    var n: usize = 0;
+    while (weights.get(std.fmt.bufPrint(&kb, "{s}mtp." ++ pre ++ "experts.{d}.gate_proj.weight", .{ p, n }) catch return) != null) n += 1;
+
+    const alloc = weights.allocator;
+    var parts: std.ArrayList(mlx.mlx_array) = .empty;
+    defer parts.deinit(alloc);
+    inline for (.{ "gate_proj", "up_proj", "down_proj" }) |proj| inline for (.{ "weight", "scales", "biases" }) |field| {
+        parts.clearRetainingCapacity();
+        for (0..n) |e| {
+            const key = try std.fmt.bufPrint(&kb, "{s}mtp." ++ pre ++ "experts.{d}." ++ proj ++ "." ++ field, .{ p, e });
+            try parts.append(alloc, weights.get(key) orelse break);
+        }
+        if (parts.items.len > 0) {
+            if (parts.items.len != n) {
+                log.err("[mtp] expert {d} of {d} has no {s}.{s}\n", .{ parts.items.len, n, proj, field });
+                return error.MissingMtpWeight;
+            }
+            const vec = mlx.mlx_vector_array_new_data(parts.items.ptr, parts.items.len);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            // The loads first: a GPU stack waiting on hundreds of queued disk reads times out.
+            try mlx.check(mlx.mlx_eval(vec));
+            var bank = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(bank);
+            try mlx.check(mlx.mlx_stack_axis(&bank, vec, 0, s));
+            try mlx.check(mlx.mlx_array_eval(bank));
+            const name = try alloc.dupe(u8, try std.fmt.bufPrint(&kb, "{s}mtp." ++ pre ++ "switch_mlp." ++ proj ++ "." ++ field, .{p}));
+            errdefer alloc.free(name);
+            try weights.map.putNoClobber(name, bank);
+            for (0..n) |e| weights.remove(try std.fmt.bufPrint(&kb, "{s}mtp." ++ pre ++ "experts.{d}." ++ proj ++ "." ++ field, .{ p, e }));
+        }
+    };
 }
 
 /// Qwen 3.5/3.6/3.8 native head (sidecar or in-checkpoint `mtp.*`): fc over
@@ -4901,6 +4942,101 @@ test "loadMtp: MoE sidecar layout (language_model. prefix, switch_mlp experts)" 
     const fcs = mlx.getShape(m.fc.w);
     try testing.expectEqual(@as(c_int, 8), fcs[0]);
     try testing.expectEqual(@as(c_int, 16), fcs[1]);
+}
+
+test "loadMtp: a MoE sidecar with one tensor per expert stacks them into the switch_mlp banks" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const save_map = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(save_map);
+    var owned: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (owned.items) |a| _ = mlx.mlx_array_free(a);
+        owned.deinit(allocator);
+    }
+    const put = struct {
+        fn f(map: mlx.mlx_map_string_to_array, list: *std.ArrayList(mlx.mlx_array), alloc: std.mem.Allocator, key: [*:0]const u8, shape: []const c_int, val: f32, st: mlx.mlx_stream) !void {
+            const v = mlx.mlx_array_new_float(val);
+            defer _ = mlx.mlx_array_free(v);
+            var a = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_full(&a, shape.ptr, shape.len, v, .bfloat16, st));
+            try mlx.check(mlx.mlx_array_eval(a));
+            _ = mlx.mlx_map_string_to_array_insert(map, key, a);
+            try list.append(alloc, a);
+        }
+    }.f;
+
+    const p = "language_model.mtp.";
+    inline for (.{
+        .{ "fc.weight", &[_]c_int{ 16, 8 } },
+        .{ "pre_fc_norm_embedding.weight", &[_]c_int{8} },
+        .{ "pre_fc_norm_hidden.weight", &[_]c_int{8} },
+        .{ "norm.weight", &[_]c_int{8} },
+        .{ "layers.0.input_layernorm.weight", &[_]c_int{8} },
+        .{ "layers.0.post_attention_layernorm.weight", &[_]c_int{8} },
+        .{ "layers.0.self_attn.q_norm.weight", &[_]c_int{4} },
+        .{ "layers.0.self_attn.k_norm.weight", &[_]c_int{4} },
+        .{ "layers.0.self_attn.q_proj.weight", &[_]c_int{ 16, 8 } },
+        .{ "layers.0.self_attn.k_proj.weight", &[_]c_int{ 8, 8 } },
+        .{ "layers.0.self_attn.v_proj.weight", &[_]c_int{ 8, 8 } },
+        .{ "layers.0.self_attn.o_proj.weight", &[_]c_int{ 8, 8 } },
+        .{ "layers.0.mlp.gate.weight", &[_]c_int{ 4, 8 } },
+        .{ "layers.0.mlp.shared_expert.gate_proj.weight", &[_]c_int{ 16, 8 } },
+        .{ "layers.0.mlp.shared_expert.up_proj.weight", &[_]c_int{ 16, 8 } },
+        .{ "layers.0.mlp.shared_expert.down_proj.weight", &[_]c_int{ 8, 16 } },
+        .{ "layers.0.mlp.shared_expert_gate.weight", &[_]c_int{ 1, 8 } },
+    }) |t| try put(save_map, &owned, allocator, p ++ t[0], t[1], 1, s);
+    // Expert e holds the value e + 1, so the bank's row order is observable.
+    inline for (0..4) |e| {
+        const ex = p ++ "layers.0.mlp.experts." ++ std.fmt.comptimePrint("{d}", .{e});
+        try put(save_map, &owned, allocator, ex ++ ".gate_proj.weight", &.{ 16, 8 }, e + 1, s);
+        try put(save_map, &owned, allocator, ex ++ ".up_proj.weight", &.{ 16, 8 }, e + 1, s);
+        try put(save_map, &owned, allocator, ex ++ ".down_proj.weight", &.{ 8, 16 }, e + 1, s);
+    }
+
+    var dir_buf: [512]u8 = undefined;
+    const dir_n = try tmp.dir.realPath(io, &dir_buf);
+    const dir_abs = dir_buf[0..dir_n];
+    const file_path = try std.fs.path.joinZ(allocator, &.{ dir_abs, "model-mtp.safetensors" });
+    defer allocator.free(file_path);
+    const meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    try mlx.check(mlx.mlx_save_safetensors(file_path.ptr, save_map, meta));
+
+    var m = try loadMtp(io, allocator, s, dir_abs);
+    defer m.deinit();
+    const mw = switch (m.mlp) {
+        .moe => |*mw| mw,
+        else => return error.TestUnexpectedResult,
+    };
+    const banks = [_]struct { w: mlx.mlx_array, out: c_int, in: c_int }{
+        .{ .w = mw.switch_gate_w, .out = 16, .in = 8 },
+        .{ .w = mw.switch_up_w, .out = 16, .in = 8 },
+        .{ .w = mw.switch_down_w, .out = 8, .in = 16 },
+    };
+    for (banks) |b| {
+        const sh = mlx.getShape(b.w);
+        try testing.expectEqualSlices(c_int, &.{ 4, b.out, b.in }, sh);
+        const idx = mlx.mlx_array_new_int(2);
+        defer _ = mlx.mlx_array_free(idx);
+        var row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row);
+        try mlx.check(mlx.mlx_take_axis(&row, b.w, idx, 0, s));
+        var mean = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mean);
+        try mlx.check(mlx.mlx_mean(&mean, row, false, s));
+        var mean32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mean32);
+        try mlx.check(mlx.mlx_astype(&mean32, mean, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(mean32));
+        var v: f32 = 0;
+        try mlx.check(mlx.mlx_array_item_float32(&v, mean32));
+        try testing.expectEqual(@as(f32, 3), v);
+    }
 }
 
 /// Random dense bf16 sidecar (hidden 8, head_dim 4, 2 q / 2 kv heads, mlp 16, vocab 16)
