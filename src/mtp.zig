@@ -2195,6 +2195,37 @@ fn loadMoeTriple(w: *const Weights, prefix: []const u8) !MoeTriple {
     };
 }
 
+/// A head's expert bank. A dense one is stored `[E, out, in]` but the dense gather reads
+/// `[E, in, out]` (the trunk transposes at load): quantize it like the head's other bf16
+/// linears, or transpose it when head quantization is off.
+fn loadHeadExpertBank(w: *const Weights, prefix: []const u8, s: mlx.mlx_stream, stats: *HeadQuantStats) !MoeTriple {
+    var t = try loadMoeTriple(w, prefix);
+    errdefer t.deinit();
+    if (t.s.ctx != null) return t;
+    const shape = mlx.getShape(t.w);
+    const bits = headQuantBits();
+    if (bits != 0 and shape.len == 3 and @rem(shape[2], @as(c_int, @intCast(HEAD_QUANT_GROUP))) == 0) {
+        var triple = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(triple);
+        try mlx.check(mlx.mlx_quantize(&triple, t.w, mlx.mlx_optional_int.some(@intCast(HEAD_QUANT_GROUP)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, s));
+        try mlx.check(mlx.mlx_eval(triple));
+        var q: [3]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+        for (&q, 0..) |*a, i| try mlx.check(mlx.mlx_vector_array_get(a, triple, i));
+        t.deinit();
+        t = .{ .w = q[0], .s = q[1], .b = q[2] };
+        const rows: u64 = @intCast(shape[0] * shape[1]);
+        const cols: u64 = @intCast(shape[2]);
+        stats.n += 1;
+        stats.before_bytes += rows * cols * 2;
+        stats.after_bytes += rows * cols * bits / 8 + 2 * rows * (cols / HEAD_QUANT_GROUP) * 2;
+        return t;
+    }
+    const tw = try transformer_mod.transposeBf16WeightPub(t.w, s);
+    _ = mlx.mlx_array_free(t.w);
+    t.w = tw;
+    return t;
+}
+
 /// Load the head's weights from the MAIN checkpoint: the shards the index
 /// names for `mtp.*` keys (typically one), or the single
 /// `model.safetensors` when there is no index. Safetensors loads are
@@ -2507,11 +2538,11 @@ fn loadQwenMtpMlp(
     // Packed 3D expert tensors load raw (the trunk's gather paths own the
     // orientation); 2D shared/seg linears ride loadLinear so a bf16 build
     // gets the dense pre-transpose, exactly like the trunk.
-    var sg = try loadMoeTriple(weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.gate_proj"));
+    var sg = try loadHeadExpertBank(weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.gate_proj"), s, hq_stats);
     errdefer sg.deinit();
-    var su = try loadMoeTriple(weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.up_proj"));
+    var su = try loadHeadExpertBank(weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.up_proj"), s, hq_stats);
     errdefer su.deinit();
-    var sd = try loadMoeTriple(weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.down_proj"));
+    var sd = try loadHeadExpertBank(weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.down_proj"), s, hq_stats);
     errdefer sd.deinit();
     var shg = try loadTrunkLinear(weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.gate_proj"), s, hq_stats);
     errdefer shg.deinit();
@@ -5018,9 +5049,10 @@ test "loadMtp: a MoE sidecar with one tensor per expert stacks them into the swi
         .{ .w = mw.switch_up_w, .out = 16, .in = 8 },
         .{ .w = mw.switch_down_w, .out = 8, .in = 16 },
     };
+    // Too narrow to quantize at g64: dense, in the gather's `[E, in, out]` orientation.
     for (banks) |b| {
         const sh = mlx.getShape(b.w);
-        try testing.expectEqualSlices(c_int, &.{ 4, b.out, b.in }, sh);
+        try testing.expectEqualSlices(c_int, &.{ 4, b.in, b.out }, sh);
         const idx = mlx.mlx_array_new_int(2);
         defer _ = mlx.mlx_array_free(idx);
         var row = mlx.mlx_array_new();
@@ -5037,6 +5069,31 @@ test "loadMtp: a MoE sidecar with one tensor per expert stacks them into the swi
         try mlx.check(mlx.mlx_array_item_float32(&v, mean32));
         try testing.expectEqual(@as(f32, 3), v);
     }
+}
+
+test "loadHeadExpertBank: a bf16 bank quantizes like the head's linears, or transposes for the dense gather" {
+    const s = mlx.gpuStream();
+    var w = Weights.init(testing.allocator);
+    defer w.deinit();
+    var raw = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_ones(&raw, &[_]c_int{ 2, 8, 128 }, 3, .bfloat16, s));
+    try w.map.put(try testing.allocator.dupe(u8, "e.weight"), raw);
+
+    var stats: HeadQuantStats = .{};
+    head_quant_override = 4;
+    var q = try loadHeadExpertBank(&w, "e", s, &stats);
+    defer q.deinit();
+    try testing.expectEqualSlices(c_int, &.{ 2, 8, 128 * 4 / 32 }, mlx.getShape(q.w));
+    try testing.expectEqualSlices(c_int, &.{ 2, 8, 128 / HEAD_QUANT_GROUP }, mlx.getShape(q.s));
+    try testing.expect(q.b.ctx != null);
+    try testing.expectEqual(@as(u32, 1), stats.n);
+
+    head_quant_override = 0;
+    defer head_quant_override = null;
+    var d = try loadHeadExpertBank(&w, "e", s, &stats);
+    defer d.deinit();
+    try testing.expectEqualSlices(c_int, &.{ 2, 128, 8 }, mlx.getShape(d.w));
+    try testing.expect(d.s.ctx == null);
 }
 
 /// Random dense bf16 sidecar (hidden 8, head_dim 4, 2 q / 2 kv heads, mlp 16, vocab 16)
