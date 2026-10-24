@@ -5732,3 +5732,7 @@ Defect: Flint's prefill slowed as prompts grew past one chunk, and `--prefill-ch
 Cause: its 35 sliding layers (window 513) ran MLX's fused SDPA with an `[chunk, chunk + 513]` array mask. The kernel computes every key block and masks after, so at a wide chunk a sliding layer pays the whole chunk instead of its band. `msv_attn_p256` skips out-of-band blocks, but only at hd 256; Flint is 128.
 Fix: `nax_attention`'s kernel takes q/k 128 as well as 192 (the `DK` template) and serves Flint's sliding prefill with its sinks. Its full layers keep MLX's causal kernel, which was faster there.
 Guards: `nax attention q/k 192 (MiMo) or 128 (Flint), v 128` (fp32 truth, incl. a 32/4-head window-513 case); `flint fixture` runs the arm against rec_mlx's model.
+
+## Old SSD-tier roots were never reclaimed: 56 GB under a 20 GB cap (2026-10-19)
+
+**Defect.** `~/.mlx-serve/kv-cache` held 56 GB with `--prefix-cache-disk 20GB`. **Cause.** The cap bounds one model's root (`<base>/<fingerprint>`), and a root is renamed whenever the model's config or overrides change; the sweep over the other roots ran in SSD-first mode only, and even there let them hold one more cap's worth. **Fix.** Every tier sweeps sibling roots at load, down to what its own root leaves of the cap (`sweepSiblings`). **Guard.** `DiskTier: every tier sweeps sibling roots down to what its own root leaves of the cap`.

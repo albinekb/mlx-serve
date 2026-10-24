@@ -2625,7 +2625,7 @@ pub const HotPrefixCache = struct {
         d.ssd_first = self.ssd_first;
         d.enableBackgroundWriter();
         // Startup sweep of strays + root-wide LRU across sibling fingerprints.
-        if (self.ssd_first) d.sweepSiblings();
+        d.sweepSiblings();
     }
 
     /// #330 adjacent: when the byte budget is exceeded with the just-updated
