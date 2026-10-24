@@ -2044,9 +2044,20 @@ pub const Generator = struct {
     /// fresh economic evaluation instead of inheriting the bad early yield.
     yield_steps: u64 = 0,
     yield_accepted: u64 = 0,
+    pld_window_attempted: u64 = 0,
+    pld_window_accepted: u64 = 0,
     /// Steps spent in disabled mode since the gate tripped (drives the
     /// periodic `specShouldReenable` re-check).
     disabled_steps: u64 = 0,
+
+    pub fn reenablePld(self: *Generator) void {
+        self.spec_disabled_runtime = false;
+        self.disabled_steps = 0;
+        self.yield_steps = 0;
+        self.yield_accepted = 0;
+        self.pld_window_attempted = 0;
+        self.pld_window_accepted = 0;
+    }
     /// Number of attempts before the runtime gate considers disabling.
     /// Below this we trust the prompt-time gate.
     ///
@@ -4658,19 +4669,13 @@ pub const Generator = struct {
                     .stopped => return null,
                     .already_clean => {
                         //log.info("  pld=re-enabled (generated tail turned repetitive after {d} disabled steps)\n", .{self.disabled_steps});
-                        self.spec_disabled_runtime = false;
-                        self.disabled_steps = 0;
-                        self.yield_steps = 0;
-                        self.yield_accepted = 0;
+                        self.reenablePld();
                         // Invariant already holds — fall through to the
                         // enabled flow below in this same call.
                     },
                     .drained => |drained_tok| {
                         //log.info("  pld=re-enabled (generated tail turned repetitive after {d} disabled steps)\n", .{self.disabled_steps});
-                        self.spec_disabled_runtime = false;
-                        self.disabled_steps = 0;
-                        self.yield_steps = 0;
-                        self.yield_accepted = 0;
+                        self.reenablePld();
                         const tokens = try allocator.alloc(u32, 1);
                         tokens[0] = drained_tok;
                         return PldStepResult{
@@ -4858,6 +4863,7 @@ pub const Generator = struct {
         };
         // verify_logits shape [1, 1+m, V]. Sliced and freed below.
         self.pld_attempted += 1;
+        self.pld_window_attempted += 1;
 
         const vl_shape = mlx.getShape(verify_logits);
         const slice_strides = [_]c_int{ 1, 1, 1 };
@@ -5023,6 +5029,7 @@ pub const Generator = struct {
         for (draft[0..accepted]) |d| try self.generated_ids.append(allocator, d);
 
         self.pld_accepted_tokens += accepted;
+        self.pld_window_accepted += accepted;
         self.advanceStep(num_emit);
 
         // No post-step forward — `next_token_id = new_t1` and exit. The next
@@ -5041,16 +5048,16 @@ pub const Generator = struct {
         // upper-bound draft length (`max_draft`); matches with shorter accepts
         // still divide by this max so a workload with consistently-short
         // n-gram matches DOES get throttled.
-        if (runtimeGateShouldDisable(self.pld_attempted, self.pld_accepted_tokens, max_draft)) {
-            const drafts_proposed: u64 = self.pld_attempted * @as(u64, max_draft);
+        if (runtimeGateShouldDisable(self.pld_window_attempted, self.pld_window_accepted, max_draft)) {
+            const drafts_proposed: u64 = self.pld_window_attempted * @as(u64, max_draft);
             const rate: f32 = if (drafts_proposed > 0)
-                @as(f32, @floatFromInt(self.pld_accepted_tokens)) /
+                @as(f32, @floatFromInt(self.pld_window_accepted)) /
                     @as(f32, @floatFromInt(drafts_proposed))
             else
                 0.0;
             log.info(
                 "  pld=disabled (runtime per-draft rate {d:.2} < {d:.2} after {d} attempts)\n",
-                .{ rate, RUNTIME_GATE_MIN_PER_DRAFT_RATE, self.pld_attempted },
+                .{ rate, RUNTIME_GATE_MIN_PER_DRAFT_RATE, self.pld_window_attempted },
             );
             self.spec_disabled_runtime = true;
             self.disabled_steps = 0;
@@ -16665,6 +16672,20 @@ test "Generator.specShouldReenable gates mid-request PLD re-activation" {
 
     // Too little generated yet → not enough signal, stay disabled.
     try testing.expect(!Generator.specShouldReenable(&committed, 8));
+
+    // Re-enabling starts a fresh runtime-gate window while keeping cumulative stats.
+    var g = mtpEvTestGenerator();
+    g.spec_disabled_runtime = true;
+    g.pld_attempted = 5;
+    g.pld_accepted_tokens = 2;
+    g.pld_window_attempted = 5;
+    g.pld_window_accepted = 2;
+    try testing.expect(Generator.runtimeGateShouldDisable(g.pld_window_attempted, g.pld_window_accepted, 5));
+    g.reenablePld();
+    try testing.expect(!g.spec_disabled_runtime);
+    try testing.expectEqual(@as(u64, 5), g.pld_attempted);
+    try testing.expectEqual(@as(u64, 2), g.pld_accepted_tokens);
+    try testing.expect(!Generator.runtimeGateShouldDisable(g.pld_window_attempted + 1, g.pld_window_accepted, 5));
 }
 
 test "InitOptions.lookup_prompt overrides prompt_ids_owned source" {
