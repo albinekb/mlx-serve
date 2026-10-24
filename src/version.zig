@@ -15,6 +15,10 @@ const std = @import("std");
 pub const Info = struct {
     /// mlx-serve app version (`build_options.version`).
     app: []const u8,
+    /// Dev-build stamp (`build_options.build_id`): HEAD short sha on local
+    /// builds, empty on CI releases — the tray badge and /api/version read it
+    /// to say "custom build". No stamp → "unknown".
+    build: []const u8,
     /// MLX core, from `mlx_version()` at runtime.
     mlx: []const u8,
     /// mlx-c C bindings, the pinned submodule revision (no runtime API).
@@ -42,6 +46,7 @@ pub const Info = struct {
 /// every line always has a value token.
 pub fn writeReport(w: *std.Io.Writer, info: Info) !void {
     try w.print("mlx-serve {s}\n", .{val(info.app)});
+    try w.print("build {s}\n", .{val(info.build)});
     try w.print("mlx {s}\n", .{val(info.mlx)});
     try w.print("mlx-c {s}\n", .{val(info.mlx_c)});
     try w.print("nax {s}\n", .{val(info.nax)});
@@ -72,6 +77,7 @@ fn val(s: []const u8) []const u8 {
 test "version: report renders one name-value line per component" {
     const s = try report(std.testing.allocator, .{
         .app = "26.7.9",
+        .build = "aa4bfb3e-dirty",
         .mlx = "0.32.0",
         .mlx_c = "0.6.0",
         .nax = "on (M5 neural accelerators)",
@@ -84,6 +90,7 @@ test "version: report renders one name-value line per component" {
     defer std.testing.allocator.free(s);
     try std.testing.expectEqualStrings(
         \\mlx-serve 26.7.9
+        \\build aa4bfb3e-dirty
         \\mlx 0.32.0
         \\mlx-c 0.6.0
         \\nax on (M5 neural accelerators)
@@ -98,6 +105,7 @@ test "version: report renders one name-value line per component" {
 test "version: empty ggml commit drops the parenthetical; blank pins read as unknown" {
     const s = try report(std.testing.allocator, .{
         .app = "26.7.9",
+        .build = "", // release CI: -Dgit-sha set, so no dev stamp
         .mlx = "0.32.0",
         .mlx_c = "", // build.sh couldn't resolve it (dev build)
         .nax = "",
@@ -110,6 +118,7 @@ test "version: empty ggml commit drops the parenthetical; blank pins read as unk
     defer std.testing.allocator.free(s);
     try std.testing.expectEqualStrings(
         \\mlx-serve 26.7.9
+        \\build unknown
         \\mlx 0.32.0
         \\mlx-c unknown
         \\nax unknown

@@ -41,6 +41,7 @@ enum EngineVersions {
     /// renders (ugly beats invisible).
     static func displayLabel(_ name: String) -> String {
         switch name {
+        case "build": return "Build"
         case "mlx": return "MLX"
         case "mlx-c": return "mlx-c"
         case "nax": return "M5 Neural Accelerators"
@@ -55,6 +56,7 @@ enum EngineVersions {
     /// Explainer text under a component row; empty for unknown names.
     static func explainer(_ name: String) -> String {
         switch name {
+        case "build": return "Dev-build stamp baked in at compile time — the HEAD sha of a local build. Release builds carry no stamp and report unknown."
         case "mlx": return "Apple's MLX array framework — the native engine for `.safetensors` models."
         case "mlx-c": return "The C bindings the server links MLX through (pinned submodule revision)."
         case "nax": return "Whether MLX dispatches to the M5 GPU's neural accelerators (NAX). The bundled MLX always ships the NAX kernels; \"on\" needs an M5-class GPU on macOS 26.2+."

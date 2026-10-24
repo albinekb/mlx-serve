@@ -3067,7 +3067,7 @@ fn handleOllamaEarly(allocator: std.mem.Allocator, stream: *Conn, method: []cons
     const is_post = std.mem.eql(u8, method, "POST");
     if ((is_get or std.mem.eql(u8, method, "HEAD")) and std.mem.eql(u8, path, "/api/version")) {
         log.debug("{s} /api/version -> 200\n", .{method});
-        const vbody = try std.fmt.allocPrint(allocator, "{{\"version\":\"{s}\"}}", .{build_options.version});
+        const vbody = try std.fmt.allocPrint(allocator, "{{\"version\":\"{s}\",\"build\":\"{s}\"}}", .{ build_options.version, build_options.build_id });
         defer allocator.free(vbody);
         try sendResponse(stream, "200 OK", "application/json", if (is_get) vbody else "");
         return true;
@@ -8758,7 +8758,9 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     defer allocator.free(settings_json);
     const cluster_json = try @import("distributed.zig").propsJson(allocator);
     defer allocator.free(cluster_json);
-    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s},\"registry_generation\":{d}", .{ ane_json, ngram_json, batching_json, settings_json, cluster_json, registryGeneration() });
+    // `build` names the dev stamp at the props ROOT (not per-model `settings`)
+    // so the tray badge answers even before a model loads.
+    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s},\"registry_generation\":{d},\"build\":\"{s}\"", .{ ane_json, ngram_json, batching_json, settings_json, cluster_json, registryGeneration(), build_options.build_id });
     defer allocator.free(extra_json);
 
     const kv_cache_mem: u64 = if (global_scheduler) |sch|
@@ -8800,8 +8802,8 @@ fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     const cluster_json = try @import("distributed.zig").propsJson(allocator);
     defer allocator.free(cluster_json);
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s},"registry_generation":{d}}}
-    , .{ active_mem, peak_mem, available_mem, residentWeightsBytes(stream.io), scheduler_mod.MAX_BATCH_GROUP, cluster_json, registryGeneration() });
+        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s},"registry_generation":{d},"build":"{s}"}}
+    , .{ active_mem, peak_mem, available_mem, residentWeightsBytes(stream.io), scheduler_mod.MAX_BATCH_GROUP, cluster_json, registryGeneration(), build_options.build_id });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }

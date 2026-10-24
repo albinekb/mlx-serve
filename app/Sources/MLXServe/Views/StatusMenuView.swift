@@ -221,6 +221,18 @@ struct StatusMenuView: View {
             Text(L10n.text(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""))
                 .font(.app(.caption))
                 .foregroundStyle(.tertiary)
+            if let build = server.serverBuild {
+                // A dev-build stamp means the running binary is not a shipped
+                // release — the badge says WHICH build, since the version
+                // string alone can't (a local build reuses the last tag).
+                Text(build)
+                    .font(.app(.caption2, design: .monospaced))
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(Color.orange.opacity(0.14)))
+                    .help("Custom server build — not a shipped release")
+            }
             Spacer(minLength: 6)
             TrayStatusChip(status: server.status)
             Button { openSettings() } label: {

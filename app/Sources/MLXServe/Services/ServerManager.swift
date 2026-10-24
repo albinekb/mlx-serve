@@ -74,6 +74,10 @@ class ServerManager: ObservableObject {
     @Published var batching: BatchingInfo?
     /// The Thunderbolt cluster this server hosts, from `/props`; nil when it hosts none.
     @Published var cluster: ClusterInfo?
+    /// The running server's dev-build stamp (`/props` "build"): a HEAD sha
+    /// on local/custom builds, nil on CI releases (and on older servers that
+    /// never emit the field). The tray header badge keys on it.
+    @Published var serverBuild: String?
     /// Live throughput, nil when the server runs without `--metrics`.
     @Published var throughput: ThroughputSnapshot?
     /// Live decode / prefill tok/s, derived from the gauge delta between the
@@ -325,6 +329,7 @@ class ServerManager: ObservableObject {
         process = nil
         status = .stopped
         modelInfo = nil
+        serverBuild = nil
         // `residentChatModel` falls back to `allModels.first { loaded }` when
         // `modelInfo` is nil — leaving this stale after a stop meant a picker
         // switch made while stopped still reported the OLD model resident
@@ -415,6 +420,9 @@ class ServerManager: ObservableObject {
         let shortErr = Self.summarizeCrash(errSnippet, exitCode: exitCode)
         let fullLog = errSnippet.isEmpty ? "(no stderr captured — exit code \(exitCode))" : errSnippet
 
+        // A dead server carries no stamp — the badge must not keep naming a
+        // build that is no longer the process answering.
+        serverBuild = nil
         if case .running = status {
             status = .error("Exited unexpectedly")
             lastError = shortErr
@@ -646,6 +654,7 @@ class ServerManager: ObservableObject {
             specCost = props.specCost
             batching = props.batching
             cluster = props.cluster
+            serverBuild = props.serverBuild
             await noteRegistryGeneration(props.registryGeneration)
         }
         if let snap = try? await api.fetchThroughput(port: port) {
@@ -672,6 +681,7 @@ class ServerManager: ObservableObject {
     func refreshPairState() async {
         guard status == .running, let props = try? await api.fetchProps(port: port) else { return }
         cluster = props.cluster
+        serverBuild = props.serverBuild
         await noteRegistryGeneration(props.registryGeneration)
     }
 

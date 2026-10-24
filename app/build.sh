@@ -233,14 +233,22 @@ build_engine() {
     # Engine-version pins surfaced by `mlx-serve --version` (parsed by the app so
     # Settings can show engine versions without booting the server — src/version.zig).
     # MLX + ggml self-report at runtime; these three have no runtime API:
-    local mlxc_version ds4_commit llama_tag
+    local mlxc_version ds4_commit llama_tag build_id
     mlxc_version="$(git -C "$PROJECT_ROOT/lib/mlxc-src" describe --tags --always 2>/dev/null)"
     ds4_commit="$(git -C "$PROJECT_ROOT/lib/ds4" rev-parse --short HEAD 2>/dev/null)"
     llama_tag="$(cat "$PROJECT_ROOT/lib/llama/.version" 2>/dev/null)"
+    # Dev-build stamp for /api/version + the tray badge: short sha, plus
+    # "-dirty" when TRACKED files are modified (-uno: untracked scratch like
+    # NOTES.md must not mark every local build dirty).
+    # --ignore-submodules=dirty: the pinned submodules' build-time patches
+    # (mlxc-src ops.cpp et al) are EXPECTED state — without it every local
+    # build is permanently "-dirty" and the marker stops meaning anything.
+    build_id="$(git -C "$PROJECT_ROOT" rev-parse --short HEAD 2>/dev/null)$(git -C "$PROJECT_ROOT" status --porcelain -uno --ignore-submodules=dirty 2>/dev/null | head -1 | grep -q . && echo "-dirty")"
     echo "→ zig build ${ZIG_OPT[*]}..."
     local start=$SECONDS
     DEVELOPER_DIR="$ZIG_DEVELOPER_DIR" "$ZIG" build "${ZIG_OPT[@]}" -Dversion="$MLX_SERVE_VERSION" \
       -Dmlx-c-version="${mlxc_version:-unknown}" -Dds4-commit="${ds4_commit:-unknown}" -Dllama-tag="${llama_tag:-unknown}" \
+      -Dbuild-id="${build_id}" \
       ${ZIG_MODE_FLAGS[@]+"${ZIG_MODE_FLAGS[@]}"} ${ZIG_GGUF_FLAGS[@]+"${ZIG_GGUF_FLAGS[@]}"} 2>&1 | tail -3
     # The bundled guest agent (static aarch64-linux ELF) rides inside the app.
     DEVELOPER_DIR="$ZIG_DEVELOPER_DIR" "$ZIG" build vz-agent 2>&1 | tail -1

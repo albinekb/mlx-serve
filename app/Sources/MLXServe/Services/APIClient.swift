@@ -428,6 +428,10 @@ class APIClient {
         let cluster: ClusterInfo?
         /// Moves whenever `/v1/models` would read differently; nil from older servers.
         let registryGeneration: UInt64?
+        /// The server's dev-build stamp (`/props` root "build"): a HEAD sha
+        /// like "aa4bfb3e" or "aa4bfb3e-dirty" on local builds, absent or empty
+        /// on CI releases — which is what the tray badge keys on.
+        let serverBuild: String?
     }
 
     func fetchProps(port: UInt16) async throws -> PropsSnapshot? {
@@ -435,9 +439,11 @@ class APIClient {
         let (data, _) = try await session.data(from: url)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let mem = json["memory"] as? [String: Any] else { return nil }
+        let build = json["build"] as? String
         return PropsSnapshot(memory: MemoryInfo.parse(mem), specCost: SpecCostInfo.parse(json), batching: BatchingInfo.parse(json),
                              cluster: ClusterInfo.parse(json),
-                             registryGeneration: (json["registry_generation"] as? NSNumber)?.uint64Value)
+                             registryGeneration: (json["registry_generation"] as? NSNumber)?.uint64Value,
+                             serverBuild: (build?.isEmpty == false) ? build : nil)
     }
 
     /// The whole `/props` document. Settings are per MODEL and the bare

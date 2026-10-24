@@ -117,6 +117,14 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "llama_tag", llama_tag);
     const git_sha = b.option([]const u8, "git-sha", "Engine build id for the round-cost table: a release sha stands for the executable bytes, which are then not hashed; the MLX dylib and metallib fingerprints are always mixed in") orelse "";
     build_options.addOption([]const u8, "git_sha", git_sha);
+    // Dev-build stamp: /api/version, --version and the tray badge name WHAT this
+    // binary is when it is not a CI release. `git_sha` set means release.yml
+    // built it, so the stamp resolves empty and shipped builds carry no badge.
+    // A plain `zig build` stamps HEAD's short sha (read straight from .git);
+    // app/build.sh passes a sha+dirty stamp itself.
+    const build_id = b.option([]const u8, "build-id", "Dev-build stamp surfaced by /api/version, --version and the tray") orelse
+        (if (git_sha.len > 0) "" else readRepoHead(b) orelse "");
+    build_options.addOption([]const u8, "build_id", build_id);
     // false for the macOS exe/tests; the iOS static-lib step (`zig build ios-lib`)
     // builds its own options with ios=true so the engine swaps the embedded
     // ds4 + llama.cpp engines for no-op stubs (iOS serves MLX safetensors only).
@@ -439,6 +447,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     build_options.addOption([]const u8, "ds4_commit", b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse readDs4Commit(b) orelse "unknown");
     build_options.addOption([]const u8, "llama_tag", readLlamaTag(b) orelse "unknown");
     build_options.addOption([]const u8, "git_sha", "");
+    build_options.addOption([]const u8, "build_id", b.option([]const u8, "build-id", "Dev-build stamp surfaced by /api/version, --version and the tray") orelse readRepoHead(b) orelse "");
     build_options.addOption(bool, "ios", false);
     build_options.addOption(bool, "ds4_engine", !windows);
     build_options.addOption(bool, "llama_engine", true);
@@ -698,6 +707,7 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     ios_options.addOption([]const u8, "ds4_commit", "unknown");
     ios_options.addOption([]const u8, "llama_tag", "unknown");
     ios_options.addOption([]const u8, "git_sha", "");
+    ios_options.addOption([]const u8, "build_id", "");
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/ios_lib.zig"),
@@ -1150,6 +1160,49 @@ fn readDs4Commit(b: *std.Build) ?[]const u8 {
     const sha = std.mem.trim(u8, head, " \t\r\n");
     if (sha.len < 7 or std.mem.startsWith(u8, sha, "ref:")) return null;
     return b.dupe(sha[0..7]);
+}
+
+/// This repo's HEAD short sha, read straight from `.git` — no `git` subprocess
+/// (same reason as readDs4Commit). Covers the cases that matter for a dev
+/// build: `.git` as a directory OR a worktree's `gitdir:` pointer file, HEAD
+/// detached OR `ref:` (loose ref file, then packed-refs). Refs live under the
+/// gitdir's `commondir` target in worktrees. Returns null when nothing
+/// resolves — the caller's `build_id` then stays empty, no badge.
+fn readRepoHead(b: *std.Build) ?[]const u8 {
+    const root = buildRootHandle(b);
+    // `.git`: a directory in a plain checkout, a `gitdir:` file in a worktree.
+    var gitdir: []const u8 = ".git";
+    if (root.readFileAlloc(b.graph.io, ".git", b.allocator, .limited(512))) |link| blk: {
+        const line = std.mem.trim(u8, link, " \t\r\n");
+        const prefix = "gitdir: ";
+        if (!std.mem.startsWith(u8, line, prefix)) break :blk;
+        const target = std.mem.trim(u8, line[prefix.len..], " \t\r\n");
+        gitdir = if (std.fs.path.isAbsolute(target)) b.dupe(target) else b.pathJoin(&.{ ".", target });
+    } else |_| {}
+    const head = root.readFileAlloc(b.graph.io, b.pathJoin(&.{ gitdir, "HEAD" }), b.allocator, .limited(256)) catch return null;
+    const line = std.mem.trim(u8, head, " \t\r\n");
+    if (!std.mem.startsWith(u8, line, "ref:"))
+        return if (line.len >= 7) b.dupe(line[0..7]) else null;
+    const ref = std.mem.trim(u8, line[4..], " \t\r\n");
+    // Loose/packed refs sit under the COMMON dir: a worktree gitdir holds only
+    // HEAD (+commondir). Plain checkouts have no commondir file.
+    var refs_dir = gitdir;
+    if (root.readFileAlloc(b.graph.io, b.pathJoin(&.{ gitdir, "commondir" }), b.allocator, .limited(512))) |cd| {
+        const target = std.mem.trim(u8, cd, " \t\r\n");
+        refs_dir = if (std.fs.path.isAbsolute(target)) b.dupe(target) else b.pathJoin(&.{ gitdir, target });
+    } else |_| {}
+    if (root.readFileAlloc(b.graph.io, b.pathJoin(&.{ refs_dir, ref }), b.allocator, .limited(64))) |sha| {
+        const s = std.mem.trim(u8, sha, " \t\r\n");
+        return if (s.len >= 7) b.dupe(s[0..7]) else null;
+    } else |_| {}
+    const packed_refs = root.readFileAlloc(b.graph.io, b.pathJoin(&.{ refs_dir, "packed-refs" }), b.allocator, .limited(4 << 20)) catch return null;
+    var it = std.mem.splitScalar(u8, packed_refs, '\n');
+    while (it.next()) |row| {
+        const r = std.mem.trim(u8, row, " \t\r");
+        if (r.len > 41 and r[40] == ' ' and std.mem.eql(u8, r[41..], ref))
+            return b.dupe(r[0..7]);
+    }
+    return null;
 }
 
 /// Module `mlx_stamp`: the staged MLX build's stamp (commits, patch inputs, CUDA arch) as

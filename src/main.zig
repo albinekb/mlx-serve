@@ -714,6 +714,7 @@ pub fn main(init: std.process.Init) !void {
             _ = mlx.mlx_version(&mlx_ver);
             const info = version_mod.Info{
                 .app = VERSION,
+                .build = build_options.build_id,
                 .mlx = std.mem.span(mlx.mlx_string_data(mlx_ver)),
                 .mlx_c = build_options.mlx_c_version,
                 .nax = transformer_mod.naxStatus(),
